@@ -2,23 +2,45 @@
 """Claude Usage Monitor — macOS menu bar app.
 
 Shows your Claude session/weekly usage in the menu bar in real time,
-reading the same data source the `/usage` command uses.
+reading the same data source the `/usage` command uses. Clicking
+"Abrir monitor" opens a native window with progress bars per quota.
 Token is read from the macOS Keychain on every refresh, so it stays
 in sync when Claude Code rotates it.
 """
 
 import json
+import os
 import ssl
 import subprocess
+import warnings
 from datetime import datetime, timezone
 from urllib import request as urlrequest
 from urllib.error import HTTPError, URLError
 
 import certifi
+import objc
 import rumps
 
-# SSL context using certifi's CA bundle (framework Python lacks system certs).
-SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
+# Setting a layer's CGColor is safe but pyobjc lacks metadata for the opaque
+# CGColorRef and warns on every call; silence it to keep the log clean.
+warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
+from AppKit import (
+    NSApplication,
+    NSBackingStoreBuffered,
+    NSColor,
+    NSFont,
+    NSImage,
+    NSImageScaleProportionallyUpOrDown,
+    NSImageView,
+    NSTextAlignmentRight,
+    NSTextField,
+    NSView,
+    NSWindow,
+    NSWindowStyleMaskClosable,
+    NSWindowStyleMaskMiniaturizable,
+    NSWindowStyleMaskTitled,
+)
+from Foundation import NSMakeRect
 
 # --- Constants ---------------------------------------------------------------
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -28,22 +50,26 @@ ANTHROPIC_BETA = "oauth-2025-04-20"
 USER_AGENT = "claude-usage-monitor/1.0"
 HTTP_TIMEOUT = 15
 
-# Percentage thresholds for the colored indicator.
+# Percentage thresholds for the colored bars.
 WARN_THRESHOLD = 70
 CRIT_THRESHOLD = 90
 
-DOT_OK = "🟢"
-DOT_WARN = "🟡"
-DOT_CRIT = "🔴"
-DOT_ERR = "⚪️"
+ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
+LOGO_PATH = os.path.join(ASSET_DIR, "claude-logo.svg")
+
+# Window layout (points).
+WIN_W = 380
+PAD = 20
+HEADER_H = 34
+ROW_H = 44
+FOOTER_H = 30
+
+SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
 
 # --- Data access -------------------------------------------------------------
 def read_access_token():
-    """Read the OAuth access token from the macOS Keychain.
-
-    Returns the token string, or None if unavailable.
-    """
+    """Read the OAuth access token from the macOS Keychain."""
     try:
         raw = subprocess.run(
             ["security", "find-generic-password", "-s", KEYCHAIN_SERVICE, "-w"],
@@ -82,8 +108,7 @@ def format_reset(resets_at):
         reset = datetime.fromisoformat(resets_at)
     except ValueError:
         return "?"
-    delta = reset - datetime.now(timezone.utc)
-    total = int(delta.total_seconds())
+    total = int((reset - datetime.now(timezone.utc)).total_seconds())
     if total <= 0:
         return "reseta agora"
     hours, rem = divmod(total, 3600)
@@ -96,56 +121,112 @@ def format_reset(resets_at):
     return f"{minutes}m"
 
 
-def limit_label(item):
-    """Build a readable label for one limit entry."""
+def limit_name(item):
+    """Readable name for one limit entry."""
     kind = item.get("kind", "")
     scope = item.get("scope") or {}
     model = (scope.get("model") or {}).get("display_name")
-
     names = {
         "session": "Sessão (5h)",
         "weekly_all": "Semanal (tudo)",
         "weekly_scoped": f"Semanal {model}" if model else "Semanal (modelo)",
     }
-    name = names.get(kind, model or kind or "Limite")
+    return names.get(kind, model or kind or "Limite")
+
+
+def limit_label(item):
+    """Full one-line label used in the dropdown menu."""
     pct = item.get("percent", 0)
     reset = format_reset(item.get("resets_at"))
-    return f"{name}: {pct}%  ·  reseta em {reset}"
-
-
-def worst_dot(limits):
-    """Pick a colored indicator based on the highest active percentage."""
-    if not limits:
-        return DOT_OK
-    top = max((l.get("percent", 0) or 0) for l in limits)
-    if top >= CRIT_THRESHOLD:
-        return DOT_CRIT
-    if top >= WARN_THRESHOLD:
-        return DOT_WARN
-    return DOT_OK
+    return f"{limit_name(item)}: {pct}%  ·  reseta em {reset}"
 
 
 def compact_title(limits):
-    """Short menu-bar title, e.g. '🟢 S44% W42%'."""
+    """Short menu-bar title, e.g. 'S44% W42%' (logo shown separately)."""
     by_kind = {l.get("kind"): l.get("percent", 0) for l in limits}
-    session = by_kind.get("session")
-    weekly = by_kind.get("weekly_all")
     parts = []
-    if session is not None:
-        parts.append(f"S{session}%")
-    if weekly is not None:
-        parts.append(f"W{weekly}%")
-    return f"{worst_dot(limits)} " + " ".join(parts) if parts else f"{worst_dot(limits)} Claude"
+    if by_kind.get("session") is not None:
+        parts.append(f"S{by_kind['session']}%")
+    if by_kind.get("weekly_all") is not None:
+        parts.append(f"W{by_kind['weekly_all']}%")
+    return " ".join(parts) if parts else "Claude"
+
+
+def severity_color(percent):
+    """NSColor for a bar based on its percentage."""
+    if percent >= CRIT_THRESHOLD:
+        return NSColor.systemRedColor()
+    if percent >= WARN_THRESHOLD:
+        return NSColor.systemOrangeColor()
+    return NSColor.systemGreenColor()
+
+
+# --- AppKit widget helpers ---------------------------------------------------
+class FlippedView(NSView):
+    """A container whose origin is top-left (y grows downward)."""
+
+    def isFlipped(self):
+        return True
+
+
+def load_logo(size):
+    """Load the Claude logo as an NSImage sized to `size` points."""
+    img = NSImage.alloc().initWithContentsOfFile_(LOGO_PATH)
+    if img is not None:
+        img.setSize_((size, size))
+    return img
+
+
+def make_label(frame, text, size=13, bold=False, color=None, align_right=False):
+    lbl = NSTextField.alloc().initWithFrame_(frame)
+    lbl.setStringValue_(text)
+    lbl.setBezeled_(False)
+    lbl.setDrawsBackground_(False)
+    lbl.setEditable_(False)
+    lbl.setSelectable_(False)
+    lbl.setFont_(NSFont.boldSystemFontOfSize_(size) if bold else NSFont.systemFontOfSize_(size))
+    lbl.setTextColor_(color or NSColor.labelColor())
+    if align_right:
+        lbl.setAlignment_(NSTextAlignmentRight)
+    return lbl
+
+
+def make_bar(frame, percent, color):
+    """A pill-shaped track with a colored fill proportional to percent."""
+    track = NSView.alloc().initWithFrame_(frame)
+    track.setWantsLayer_(True)
+    track.layer().setBackgroundColor_(NSColor.tertiaryLabelColor().CGColor())
+    track.layer().setCornerRadius_(frame.size.height / 2.0)
+    fill_w = frame.size.width * min(max(percent, 0), 100) / 100.0
+    fill = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, fill_w, frame.size.height))
+    fill.setWantsLayer_(True)
+    fill.layer().setBackgroundColor_(color.CGColor())
+    fill.layer().setCornerRadius_(frame.size.height / 2.0)
+    track.addSubview_(fill)
+    return track
 
 
 # --- App ---------------------------------------------------------------------
 class UsageMonitor(rumps.App):
     def __init__(self):
-        super().__init__("⏳ Claude", quit_button=None)
-        self.menu = ["Atualizar agora", None, "Sair"]
+        super().__init__("", icon=LOGO_PATH, template=False, quit_button=None)
+        self.title = "…"
+        self._window = None
+        self._limits = []
+        self._stamp = "—"
+        self.menu = ["Abrir monitor", "Atualizar agora", None, "Sair"]
         self.timer = rumps.Timer(self.refresh, REFRESH_SECONDS)
         self.timer.start()
         self.refresh(None)
+
+    # --- menu actions ---
+    @rumps.clicked("Abrir monitor")
+    def open_monitor(self, _):
+        if self._window is None:
+            self._build_window()
+        self._refresh_window()
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        self._window.makeKeyAndOrderFront_(None)
 
     @rumps.clicked("Atualizar agora")
     def manual_refresh(self, _):
@@ -155,6 +236,7 @@ class UsageMonitor(rumps.App):
     def quit_app(self, _):
         rumps.quit_application()
 
+    # --- data cycle ---
     def refresh(self, _):
         token = read_access_token()
         if not token:
@@ -163,10 +245,8 @@ class UsageMonitor(rumps.App):
         try:
             data = fetch_usage(token)
         except HTTPError as exc:
-            if exc.code == 401:
-                self._render_error("Token expirado — rode /usage no Claude Code")
-            else:
-                self._render_error(f"Erro HTTP {exc.code}")
+            msg = "Token expirado — rode /usage no Claude Code" if exc.code == 401 else f"Erro HTTP {exc.code}"
+            self._render_error(msg)
             return
         except (URLError, TimeoutError):
             self._render_error("Sem conexão")
@@ -175,33 +255,106 @@ class UsageMonitor(rumps.App):
             self._render_error(f"Erro: {exc}")
             return
 
-        limits = [l for l in data.get("limits", []) if l.get("percent") is not None]
-        self.title = compact_title(limits)
-        self._render_menu(limits, data)
+        self._limits = [l for l in data.get("limits", []) if l.get("percent") is not None]
+        self._stamp = datetime.now().strftime("%H:%M:%S")
+        self.title = compact_title(self._limits)
+        self._render_menu(data)
+        if self._window is not None and self._window.isVisible():
+            self._refresh_window()
 
-    def _render_menu(self, limits, data):
+    def _render_menu(self, data):
+        ordered = sorted(self._limits, key=lambda l: -(l.get("percent", 0) or 0))
         self.menu.clear()
-        for item in sorted(limits, key=lambda l: -(l.get("percent", 0) or 0)):
+        self.menu.add(rumps.MenuItem("Abrir monitor", callback=self.open_monitor))
+        self.menu.add(rumps.separator)
+        for item in ordered:
             self.menu.add(rumps.MenuItem(limit_label(item)))
-
         extra = data.get("extra_usage") or {}
         if extra.get("is_enabled") and extra.get("utilization") is not None:
             self.menu.add(rumps.MenuItem(f"Créditos extras: {extra['utilization']}%"))
-
         self.menu.add(rumps.separator)
-        stamp = datetime.now().strftime("%H:%M:%S")
-        self.menu.add(rumps.MenuItem(f"Atualizado {stamp}"))
+        self.menu.add(rumps.MenuItem(f"Atualizado {self._stamp}"))
         self.menu.add(rumps.MenuItem("Atualizar agora", callback=self.manual_refresh))
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Sair", callback=self.quit_app))
 
     def _render_error(self, message):
-        self.title = f"{DOT_ERR} Claude"
+        self.title = "⚠️"
         self.menu.clear()
+        self.menu.add(rumps.MenuItem("Abrir monitor", callback=self.open_monitor))
+        self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem(message))
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Atualizar agora", callback=self.manual_refresh))
         self.menu.add(rumps.MenuItem("Sair", callback=self.quit_app))
+
+    # --- window ---
+    def _build_window(self):
+        style = (
+            NSWindowStyleMaskTitled
+            | NSWindowStyleMaskClosable
+            | NSWindowStyleMaskMiniaturizable
+        )
+        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, WIN_W, 300), style, NSBackingStoreBuffered, False
+        )
+        win.setTitle_("Claude Usage")
+        win.setReleasedWhenClosed_(False)
+        win.center()
+        self._window = win
+
+    def _refresh_window(self):
+        if self._window is None:
+            return
+        ordered = sorted(self._limits, key=lambda l: -(l.get("percent", 0) or 0))
+        content_h = PAD + HEADER_H + max(len(ordered), 1) * ROW_H + FOOTER_H + PAD
+
+        # Resize the window while keeping its top edge anchored.
+        frame = self._window.frame()
+        top = frame.origin.y + frame.size.height
+        self._window.setContentSize_((WIN_W, content_h))
+        new_frame = self._window.frame()
+        new_frame.origin.y = top - new_frame.size.height
+        self._window.setFrameOrigin_(new_frame.origin)
+
+        root = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, WIN_W, content_h))
+        cw = WIN_W - 2 * PAD
+
+        # Header: logo + title.
+        logo = NSImageView.alloc().initWithFrame_(NSMakeRect(PAD, PAD, 26, 26))
+        logo.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+        logo.setImage_(load_logo(26))
+        root.addSubview_(logo)
+        root.addSubview_(
+            make_label(NSMakeRect(PAD + 34, PAD + 3, cw - 34, 20), "Claude Usage", size=15, bold=True)
+        )
+
+        # One row per quota.
+        y = PAD + HEADER_H
+        if not ordered:
+            root.addSubview_(
+                make_label(NSMakeRect(PAD, y, cw, 18), "Sem dados de uso.", color=NSColor.secondaryLabelColor())
+            )
+        for item in ordered:
+            pct = item.get("percent", 0) or 0
+            root.addSubview_(make_label(NSMakeRect(PAD, y, cw * 0.6, 16), limit_name(item), bold=True))
+            stats = f"{pct}%  ·  {format_reset(item.get('resets_at'))}"
+            root.addSubview_(
+                make_label(
+                    NSMakeRect(PAD + cw * 0.4, y, cw * 0.6, 16), stats,
+                    color=NSColor.secondaryLabelColor(), align_right=True,
+                )
+            )
+            root.addSubview_(make_bar(NSMakeRect(PAD, y + 22, cw, 10), pct, severity_color(pct)))
+            y += ROW_H
+
+        root.addSubview_(
+            make_label(
+                NSMakeRect(PAD, y + 4, cw, 16), f"Atualizado {self._stamp} · atualiza a cada {REFRESH_SECONDS}s",
+                size=11, color=NSColor.tertiaryLabelColor(),
+            )
+        )
+        self._window.setContentView_(root)
 
 
 if __name__ == "__main__":
