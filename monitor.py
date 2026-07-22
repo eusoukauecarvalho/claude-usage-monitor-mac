@@ -246,6 +246,7 @@ class UsageMonitor(rumps.App):
 
     @rumps.clicked("Atualizar agora")
     def manual_refresh(self, _):
+        self._retry_after_ts = 0.0  # user asked explicitly: bypass any backoff
         self.refresh(None)
 
     @rumps.clicked("Sair")
