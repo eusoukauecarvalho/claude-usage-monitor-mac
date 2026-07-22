@@ -38,9 +38,27 @@ cat > "$PLIST" <<PLISTEOF
 </plist>
 PLISTEOF
 
-echo "==> Loading LaunchAgent"
-launchctl unload "$PLIST" 2>/dev/null || true
-launchctl load "$PLIST"
+echo "==> Registering to start automatically at every login/boot"
+UID_NUM="$(id -u)"
+# RunAtLoad + KeepAlive in the plist make it launch at login and stay running.
+# Remove any previous registration, then load cleanly with the modern API.
+# The short pause avoids an "Input/output error" race between bootout/bootstrap.
+launchctl bootout "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+sleep 1
+if ! launchctl bootstrap "gui/$UID_NUM" "$PLIST" 2>/dev/null; then
+    # Fallback for older macOS without `bootstrap`.
+    launchctl unload "$PLIST" 2>/dev/null || true
+    launchctl load "$PLIST"
+fi
+# Make sure it is not disabled for this user domain.
+launchctl enable "gui/$UID_NUM/$LABEL" 2>/dev/null || true
+
+echo "==> Verifying autostart"
+if launchctl list | grep -q "$LABEL"; then
+    echo "    OK — it will start automatically every time you log in."
+else
+    echo "    WARNING — could not confirm registration; check /tmp/claude-usage-monitor.log"
+fi
 
 echo "==> Done. Look for the icon in your menu bar (top-right)."
-echo "    To stop:  launchctl unload \"$PLIST\""
+echo "    To stop / disable autostart:  ./uninstall.sh"
