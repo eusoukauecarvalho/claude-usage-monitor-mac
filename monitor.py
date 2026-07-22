@@ -12,6 +12,7 @@ import json
 import os
 import ssl
 import subprocess
+import time
 import warnings
 from datetime import datetime, timezone
 from urllib import request as urlrequest
@@ -45,7 +46,7 @@ from Foundation import NSMakeRect
 # --- Constants ---------------------------------------------------------------
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
 KEYCHAIN_SERVICE = "Claude Code-credentials"
-REFRESH_SECONDS = 60
+REFRESH_SECONDS = 90
 ANTHROPIC_BETA = "oauth-2025-04-20"
 USER_AGENT = "claude-usage-monitor/1.0"
 HTTP_TIMEOUT = 15
@@ -53,6 +54,9 @@ HTTP_TIMEOUT = 15
 # Percentage thresholds for the colored bars.
 WARN_THRESHOLD = 70
 CRIT_THRESHOLD = 90
+
+# Default backoff (seconds) when the endpoint returns 429 without Retry-After.
+DEFAULT_RETRY_AFTER = 120
 
 ASSET_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
 LOGO_PATH = os.path.join(ASSET_DIR, "claude-logo.svg")
@@ -152,6 +156,15 @@ def compact_title(limits):
     return " ".join(parts) if parts else "Claude"
 
 
+def retry_after_seconds(http_error):
+    """Seconds to wait after a 429, from the Retry-After header if present."""
+    header = http_error.headers.get("Retry-After") if http_error.headers else None
+    try:
+        return max(int(header), 1)
+    except (TypeError, ValueError):
+        return DEFAULT_RETRY_AFTER
+
+
 def severity_color(percent):
     """NSColor for a bar based on its percentage."""
     if percent >= CRIT_THRESHOLD:
@@ -214,6 +227,9 @@ class UsageMonitor(rumps.App):
         self._window = None
         self._limits = []
         self._stamp = "—"
+        self._extra_line = None
+        self._stale = None
+        self._retry_after_ts = 0.0
         self.menu = ["Abrir monitor", "Atualizar agora", None, "Sair"]
         self.timer = rumps.Timer(self.refresh, REFRESH_SECONDS)
         self.timer.start()
@@ -238,55 +254,78 @@ class UsageMonitor(rumps.App):
 
     # --- data cycle ---
     def refresh(self, _):
+        # Respect an active backoff window after a 429 (keep showing last data).
+        if time.monotonic() < self._retry_after_ts:
+            return
+
         token = read_access_token()
         if not token:
-            self._render_error("Sem token — faça login no Claude Code")
+            self._stale = "Sem token — faça login no Claude Code"
+            self._render()
             return
+
         try:
             data = fetch_usage(token)
         except HTTPError as exc:
-            msg = "Token expirado — rode /usage no Claude Code" if exc.code == 401 else f"Erro HTTP {exc.code}"
-            self._render_error(msg)
+            if exc.code == 429:
+                self._retry_after_ts = time.monotonic() + retry_after_seconds(exc)
+                self._stale = "Limite de requisições atingido — mostrando último dado"
+            elif exc.code == 401:
+                self._stale = "Token expirado — rode /usage no Claude Code"
+            else:
+                self._stale = f"Erro HTTP {exc.code} — mostrando último dado"
+            self._render()
             return
         except (URLError, TimeoutError):
-            self._render_error("Sem conexão")
+            self._stale = "Sem conexão — mostrando último dado"
+            self._render()
             return
         except Exception as exc:  # noqa: BLE001 - never crash the menu bar
-            self._render_error(f"Erro: {exc}")
+            self._stale = f"Erro: {exc}"
+            self._render()
             return
 
+        # Success: update the cached data and clear any stale flag.
         self._limits = [l for l in data.get("limits", []) if l.get("percent") is not None]
         self._stamp = datetime.now().strftime("%H:%M:%S")
-        self.title = compact_title(self._limits)
-        self._render_menu(data)
-        if self._window is not None and self._window.isVisible():
-            self._refresh_window()
+        extra = data.get("extra_usage") or {}
+        if extra.get("is_enabled") and extra.get("utilization") is not None:
+            self._extra_line = f"Créditos extras: {extra['utilization']}%"
+        else:
+            self._extra_line = None
+        self._stale = None
+        self._render()
 
-    def _render_menu(self, data):
+    def _render(self):
+        """Rebuild the menu bar title and dropdown from cached state.
+
+        Keeps showing the last good percentages even while stale, so a
+        transient rate-limit or network blip never hides the numbers.
+        """
         ordered = sorted(self._limits, key=lambda l: -(l.get("percent", 0) or 0))
+        self.title = compact_title(self._limits) if self._limits else "⚠️"
+
         self.menu.clear()
         self.menu.add(rumps.MenuItem("Abrir monitor", callback=self.open_monitor))
         self.menu.add(rumps.separator)
-        for item in ordered:
-            self.menu.add(rumps.MenuItem(limit_label(item)))
-        extra = data.get("extra_usage") or {}
-        if extra.get("is_enabled") and extra.get("utilization") is not None:
-            self.menu.add(rumps.MenuItem(f"Créditos extras: {extra['utilization']}%"))
+        if self._stale:
+            self.menu.add(rumps.MenuItem(f"⚠️ {self._stale}"))
+            self.menu.add(rumps.separator)
+        if ordered:
+            for item in ordered:
+                self.menu.add(rumps.MenuItem(limit_label(item)))
+            if self._extra_line:
+                self.menu.add(rumps.MenuItem(self._extra_line))
+        elif not self._stale:
+            self.menu.add(rumps.MenuItem("Sem dados de uso."))
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem(f"Atualizado {self._stamp}"))
         self.menu.add(rumps.MenuItem("Atualizar agora", callback=self.manual_refresh))
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Sair", callback=self.quit_app))
 
-    def _render_error(self, message):
-        self.title = "⚠️"
-        self.menu.clear()
-        self.menu.add(rumps.MenuItem("Abrir monitor", callback=self.open_monitor))
-        self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem(message))
-        self.menu.add(rumps.separator)
-        self.menu.add(rumps.MenuItem("Atualizar agora", callback=self.manual_refresh))
-        self.menu.add(rumps.MenuItem("Sair", callback=self.quit_app))
+        if self._window is not None and self._window.isVisible():
+            self._refresh_window()
 
     # --- window ---
     def _build_window(self):
@@ -348,11 +387,14 @@ class UsageMonitor(rumps.App):
             root.addSubview_(make_bar(NSMakeRect(PAD, y + 22, cw, 10), pct, severity_color(pct)))
             y += ROW_H
 
+        if self._stale:
+            footer_text = f"⚠️ {self._stale} · último dado {self._stamp}"
+            footer_color = NSColor.systemOrangeColor()
+        else:
+            footer_text = f"Atualizado {self._stamp} · atualiza a cada {REFRESH_SECONDS}s"
+            footer_color = NSColor.tertiaryLabelColor()
         root.addSubview_(
-            make_label(
-                NSMakeRect(PAD, y + 4, cw, 16), f"Atualizado {self._stamp} · atualiza a cada {REFRESH_SECONDS}s",
-                size=11, color=NSColor.tertiaryLabelColor(),
-            )
+            make_label(NSMakeRect(PAD, y + 4, cw, 16), footer_text, size=11, color=footer_color)
         )
         self._window.setContentView_(root)
 
