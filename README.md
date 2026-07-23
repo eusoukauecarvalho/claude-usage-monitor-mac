@@ -35,6 +35,7 @@ distinct **sound**. No more discovering you hit the wall mid-task.
 
 | At    | Card            | What it tells you                                                     |
 | ----- | --------------- | --------------------------------------------------------------------- |
+| **70%**  | 📊 blue      | Early heads-up — over two thirds of the window used                   |
 | **80%**  | 💡 yellow    | Money-saving tip: *reduce the effort or switch to a lighter model (e.g. Haiku)* |
 | **90%**  | ⚠️ orange    | Heads-up — you're getting close, with the reset countdown              |
 | **95%**  | 🔥 deep orange | Urgent — *almost out, hold the heavy tasks*                          |
@@ -58,8 +59,18 @@ not just a countdown — so you know *when*, not only *how long*.
   progress bar per quota (🟢 `<70%` · 🟠 `70–90%` · 🔴 `>90%`), the current
   percentage, and a countdown to each reset.
 - **Dropdown summary** — every active quota and reset time at a glance.
-- **Smart alerts** — card + push + sound at 80 / 90 / 95 / 100%, plus a confetti
+- **Smart alerts** — card + push + sound at 70 / 80 / 90 / 95 / 100%, plus a confetti
   celebration when a window renews (see [the differentiator above](#-our-differentiator-smart-delightful-alerts)).
+- **Settings window ("Configurações")** — toggle every alert level individually,
+  the renewal celebration, all notifications at once, and the notification sound
+  (turn it off to silence alerts). You can also **customize the message of each
+  alert** using the `{nome}`, `{pct}` and `{reset}` placeholders. Everything is
+  persisted in `~/Library/Application Support/claude-usage-monitor/settings.json`.
+- **Model & effort picker** — dropdowns in the settings window that set the
+  default `model` and `effortLevel` in `~/.claude/settings.json` for **new**
+  Claude Code sessions, plus an **Ultracode toggle** (xhigh effort + standing
+  multi-agent orchestration). All other keys are preserved; a running session
+  still changes via `/model` / `/effort` inside it.
 - **Reset clock time** — reset info shows the real time of day, not just a countdown.
 - **Out of the Dock** — runs as a menu-bar-only accessory app (no Dock icon to
   close by accident, no generic "Python" name).
@@ -163,8 +174,8 @@ Edit the constants at the top of `monitor.py`:
 
 - `REFRESH_SECONDS` — polling interval (default `90`)
 - `WARN_THRESHOLD` / `CRIT_THRESHOLD` — the 🟠 / 🔴 progress-bar cutoffs (default `70` / `90`)
-- `TIP_THRESHOLD` / `ALERT_THRESHOLD` / `NEAR_THRESHOLD` / `LIMIT_THRESHOLD` —
-  the alert levels (default `80` / `90` / `95` / `100`)
+- `EARLY_THRESHOLD` / `TIP_THRESHOLD` / `ALERT_THRESHOLD` / `NEAR_THRESHOLD` /
+  `LIMIT_THRESHOLD` — the alert levels (default `70` / `80` / `90` / `95` / `100`)
 - `RESET_DROP` — percentage drop that counts as a window renewal → confetti (default `20`)
 - `*_SOUND` — the system sound for each alert level (any `/System/Library/Sounds/*.aiff`)
 - `DEFAULT_RETRY_AFTER` — backoff when a `429` has no `Retry-After` (default `120`)

@@ -39,8 +39,10 @@ from AppKit import (
     NSImageView,
     NSLineBreakByWordWrapping,
     NSPanel,
+    NSPopUpButton,
     NSScreen,
     NSStatusWindowLevel,
+    NSSwitch,
     NSTextAlignmentRight,
     NSTextField,
     NSView,
@@ -53,7 +55,22 @@ from AppKit import (
     NSWindowStyleMaskNonactivatingPanel,
     NSWindowStyleMaskTitled,
 )
-from Foundation import NSMakeRect, NSTimer
+from Foundation import NSMakeRect, NSObject, NSTimer
+
+from claude_config import (
+    EFFORT_CHOICES,
+    MODEL_CHOICES,
+    read_claude_settings,
+    set_claude_option,
+)
+from settings import (
+    level_message,
+    load_settings,
+    render_message,
+    save_settings,
+    update_level,
+    update_setting,
+)
 
 # CoreAnimation classes are registered at runtime by AppKit but pyobjc has no
 # import binding for them, so look them up dynamically for the confetti burst.
@@ -73,6 +90,7 @@ WARN_THRESHOLD = 70
 CRIT_THRESHOLD = 90
 
 # Alert thresholds (percent) that trigger notifications when first crossed.
+EARLY_THRESHOLD = 70    # early heads-up: over two thirds used
 TIP_THRESHOLD = 80      # gentle tip: save tokens
 ALERT_THRESHOLD = 90    # heads-up: getting close
 NEAR_THRESHOLD = 95     # urgent: almost out
@@ -82,6 +100,7 @@ LIMIT_THRESHOLD = 100   # limit reached
 RESET_DROP = 20
 
 # System sounds played alongside each alert (paths always present on macOS).
+EARLY_SOUND = "/System/Library/Sounds/Pop.aiff"
 TIP_SOUND = "/System/Library/Sounds/Tink.aiff"
 ALERT_SOUND = "/System/Library/Sounds/Glass.aiff"
 NEAR_SOUND = "/System/Library/Sounds/Blow.aiff"
@@ -109,6 +128,13 @@ PAD = 20
 HEADER_H = 34
 ROW_H = 44
 FOOTER_H = 30
+
+# Settings window layout (points).
+SETTINGS_W = 400
+SETTINGS_SECTION_H = 26   # section header ("Notificações" / "Som")
+SETTINGS_SWITCH_H = 30    # one label + switch row
+SETTINGS_FIELD_H = 24     # editable custom-message field
+SETTINGS_BLOCK_GAP = 10   # gap after each level block
 
 SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 
@@ -452,33 +478,74 @@ def deep_orange():
 
 
 def alert_levels():
-    """Ordered high→low: (threshold, accent, sound, title_fn, message_fn).
+    """Ordered high→low: (threshold, settings_key, accent, sound, title_fn).
 
     The highest crossed level wins, so a jump from 80→100 fires only the
-    limit alert. Each level has its own emoji, color, sound and copy.
+    limit alert. Each level has its own emoji, color and sound; the message
+    comes from the user settings (custom text or the default copy).
     """
     return [
         (
-            LIMIT_THRESHOLD, NSColor.systemRedColor(), LIMIT_SOUND,
+            LIMIT_THRESHOLD, "alert_100", NSColor.systemRedColor(), LIMIT_SOUND,
             lambda name, pct: f"🚫 {name} atingiu o limite",
-            lambda name, pct, reset: f"Uso em {pct}%. Renova em {reset} — pause ou use créditos extras.",
         ),
         (
-            NEAR_THRESHOLD, deep_orange(), NEAR_SOUND,
+            NEAR_THRESHOLD, "alert_95", deep_orange(), NEAR_SOUND,
             lambda name, pct: f"🔥 {name} em {pct}%",
-            lambda name, pct, reset: f"Quase no limite! Segura as tarefas pesadas. Renova em {reset}.",
         ),
         (
-            ALERT_THRESHOLD, NSColor.systemOrangeColor(), ALERT_SOUND,
+            ALERT_THRESHOLD, "alert_90", NSColor.systemOrangeColor(), ALERT_SOUND,
             lambda name, pct: f"⚠️ {name} em {pct}%",
-            lambda name, pct, reset: f"Chegando perto do limite. Renova em {reset}.",
         ),
         (
-            TIP_THRESHOLD, NSColor.systemYellowColor(), TIP_SOUND,
+            TIP_THRESHOLD, "alert_80", NSColor.systemYellowColor(), TIP_SOUND,
             lambda name, pct: f"💡 {name} em {pct}%",
-            lambda name, pct, reset: "Dica: reduza o effort ou troque para um modelo mais leve (ex.: Haiku) para economizar.",
+        ),
+        (
+            EARLY_THRESHOLD, "alert_70", NSColor.systemBlueColor(), EARLY_SOUND,
+            lambda name, pct: f"📊 {name} em {pct}%",
         ),
     ]
+
+
+# --- Settings window ----------------------------------------------------------
+# (level_key, label) blocks shown in the settings window, one per alert.
+SETTINGS_LEVEL_ROWS = [
+    ("alert_70", "Alerta em 70%"),
+    ("alert_80", "Alerta em 80%"),
+    ("alert_90", "Alerta em 90%"),
+    ("alert_95", "Alerta em 95%"),
+    ("alert_100", "Alerta em 100% (limite)"),
+    ("renewal", "Sessão renovada 🎉"),
+]
+
+
+class ControlTarget(NSObject):
+    """Bridges AppKit control actions (switches/fields) to a Python callback."""
+
+    def initWithHandler_(self, handler):
+        self = objc.super(ControlTarget, self).init()
+        if self is None:
+            return None
+        self._handler = handler
+        return self
+
+    def controlChanged_(self, sender):
+        self._handler(sender)
+
+
+def make_message_field(frame, text):
+    """An editable single-line field that commits its value when focus leaves."""
+    field = NSTextField.alloc().initWithFrame_(frame)
+    field.setStringValue_(text)
+    field.setFont_(NSFont.systemFontOfSize_(12))
+    field.setBezeled_(True)
+    field.setEditable_(True)
+    field.setSelectable_(True)
+    field.cell().setScrollable_(True)
+    field.cell().setWraps_(False)
+    field.cell().setSendsActionOnEndEditing_(True)
+    return field
 
 
 # --- App ---------------------------------------------------------------------
@@ -494,12 +561,17 @@ class UsageMonitor(rumps.App):
         self._retry_after_ts = 0.0
         self._prev_percents = {}  # kind -> last seen percent, for edge alerts
         self._toasts = []  # live toast panels (kept referenced so ARC won't drop them)
+        self._settings = load_settings()
+        self._settings_window = None
+        self._controls = {}  # identifier -> NSSwitch/NSTextField in the settings window
+        self._popup_values = {}  # popup identifier -> ordered list of choice values
+        self._control_target = None  # created lazily with the settings window
         # Run as an accessory app: no Dock icon (so it can't be closed by
         # accident) and no generic "Python" name — it lives in the menu bar only.
         NSApplication.sharedApplication().setActivationPolicy_(
             NSApplicationActivationPolicyAccessory
         )
-        self.menu = ["Abrir monitor", "Atualizar agora", None, "Sair"]
+        self.menu = ["Abrir monitor", "Atualizar agora", None, "Configurações", None, "Sair"]
         self.timer = rumps.Timer(self.refresh, REFRESH_SECONDS)
         self.timer.start()
         self.refresh(None)
@@ -515,6 +587,10 @@ class UsageMonitor(rumps.App):
         self._refresh_window()
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         self._window.makeKeyAndOrderFront_(None)
+
+    @rumps.clicked("Configurações")
+    def open_settings(self, _):
+        self._present_settings_window()
 
     @rumps.clicked("Atualizar agora")
     def manual_refresh(self, _):
@@ -594,19 +670,34 @@ class UsageMonitor(rumps.App):
                 self._on_threshold(item, prev, pct)
 
     def _on_threshold(self, item, prev, pct):
-        """Alert when a limit first crosses 80 / 90 / 95 / 100% (highest wins)."""
+        """Alert when a limit first crosses 70 / 80 / 90 / 95 / 100% (highest wins).
+
+        Respects the user settings: the master switch mutes everything, and
+        each level can be disabled individually or have a custom message.
+        """
+        if not self._settings["notifications_enabled"]:
+            return
         name = limit_name(item)
         reset = format_reset(item.get("resets_at"))
-        for at, accent, sound, title_fn, msg_fn in alert_levels():
+        for at, key, accent, sound, title_fn in alert_levels():
             if prev < at <= pct:
-                self._show_toast(title_fn(name, pct), msg_fn(name, pct, reset), accent, sound=sound)
+                if self._settings["levels"][key]["enabled"]:
+                    message = render_message(level_message(self._settings, key), name, pct, reset)
+                    self._show_toast(title_fn(name, pct), message, accent, sound=sound)
                 return
 
     def _on_reset(self, item):
-        """Celebrate a renewed window with a confetti toast."""
+        """Celebrate a renewed window with a confetti toast (if enabled)."""
+        if not self._settings["notifications_enabled"]:
+            return
+        if not self._settings["levels"]["renewal"]["enabled"]:
+            return
         name = limit_name(item)
+        pct = item.get("percent", 0) or 0
+        reset = format_reset(item.get("resets_at"))
+        message = render_message(level_message(self._settings, "renewal"), name, pct, reset)
         self._show_toast(
-            f"🎉 {name} renovada!", "Sua janela voltou — quota disponível de novo.",
+            f"🎉 {name} renovada!", message,
             NSColor.systemGreenColor(), sound=CELEBRATE_SOUND, confetti=True,
         )
 
@@ -620,7 +711,7 @@ class UsageMonitor(rumps.App):
         """
         if push:
             push_notification(title, message)
-        if sound:
+        if sound and self._settings["sound_enabled"]:
             play_sound(sound)
 
         width = TOAST_W
@@ -691,10 +782,198 @@ class UsageMonitor(rumps.App):
         self.menu.add(rumps.MenuItem(f"Atualizado {self._stamp}"))
         self.menu.add(rumps.MenuItem("Atualizar agora", callback=self.manual_refresh))
         self.menu.add(rumps.separator)
+        self.menu.add(rumps.MenuItem("Configurações", callback=self.open_settings))
+        self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Sair", callback=self.quit_app))
 
         if self._window is not None and self._window.isVisible():
             self._refresh_window()
+
+    # --- settings window ---
+    def _present_settings_window(self):
+        if self._settings_window is None:
+            self._build_settings_window()
+        self._refresh_settings_window()
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        self._settings_window.makeKeyAndOrderFront_(None)
+
+    def _build_settings_window(self):
+        self._control_target = ControlTarget.alloc().initWithHandler_(self._on_control_changed)
+        style = NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, SETTINGS_W, 400), style, NSBackingStoreBuffered, False
+        )
+        win.setTitle_("Configurações")
+        win.setReleasedWhenClosed_(False)
+        win.center()
+        self._settings_window = win
+
+    def _add_switch_row(self, root, y, ident, label, indent=False):
+        """One 'label + switch' row; registers the switch under `ident`."""
+        x = PAD + (14 if indent else 0)
+        cw = SETTINGS_W - 2 * PAD
+        root.addSubview_(make_label(NSMakeRect(x, y + 5, cw - 70, 18), label, size=13))
+        switch = NSSwitch.alloc().initWithFrame_(
+            NSMakeRect(SETTINGS_W - PAD - 40, y, 40, 24)
+        )
+        switch.setState_(1)
+        switch.setIdentifier_(ident)
+        switch.setTarget_(self._control_target)
+        switch.setAction_("controlChanged:")
+        root.addSubview_(switch)
+        self._controls[ident] = switch
+        return y + SETTINGS_SWITCH_H
+
+    def _add_popup_row(self, root, y, ident, label, choices, current):
+        """One 'label + dropdown' row; tracks the choice values under `ident`.
+
+        If the current value in settings.json is not one of our presets
+        (e.g. a full model ID), it is appended as an extra choice so the
+        picker always shows the truth.
+        """
+        cw = SETTINGS_W - 2 * PAD
+        root.addSubview_(make_label(NSMakeRect(PAD, y + 5, cw - 190, 18), label, size=13))
+        popup = NSPopUpButton.alloc().initWithFrame_pullsDown_(
+            NSMakeRect(SETTINGS_W - PAD - 180, y, 180, 26), False
+        )
+        values = [value for value, _title in choices]
+        for _value, title in choices:
+            popup.addItemWithTitle_(title)
+        if current is not None and current not in values:
+            popup.addItemWithTitle_(str(current))
+            values.append(current)
+        popup.selectItemAtIndex_(values.index(current) if current in values else 0)
+        popup.setIdentifier_(ident)
+        popup.setTarget_(self._control_target)
+        popup.setAction_("controlChanged:")
+        root.addSubview_(popup)
+        self._controls[ident] = popup
+        self._popup_values[ident] = values
+        return y + SETTINGS_SWITCH_H
+
+    def _add_message_field(self, root, y, key):
+        """The editable custom-message field for one alert level."""
+        x = PAD + 14
+        stored = self._settings["levels"][key]["message"].strip()
+        field = make_message_field(
+            NSMakeRect(x, y, SETTINGS_W - PAD - x, SETTINGS_FIELD_H),
+            stored or level_message(self._settings, key),
+        )
+        field.setIdentifier_(f"msg:{key}")
+        field.setTarget_(self._control_target)
+        field.setAction_("controlChanged:")
+        root.addSubview_(field)
+        self._controls[f"msg:{key}"] = field
+        return y + SETTINGS_FIELD_H + SETTINGS_BLOCK_GAP
+
+    def _refresh_settings_window(self):
+        """Rebuild the settings content from the current persisted settings."""
+        self._controls = {}
+        self._popup_values = {}
+        level_block_h = SETTINGS_SWITCH_H + SETTINGS_FIELD_H + SETTINGS_BLOCK_GAP
+        content_h = (
+            PAD
+            + SETTINGS_SECTION_H + SETTINGS_SWITCH_H
+            + len(SETTINGS_LEVEL_ROWS) * level_block_h
+            + SETTINGS_SECTION_H + SETTINGS_SWITCH_H
+            + 34  # placeholder hint (two short lines)
+            + SETTINGS_SECTION_H + 3 * SETTINGS_SWITCH_H
+            + 34  # new-sessions hint (two short lines)
+            + PAD
+        )
+        root = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, SETTINGS_W, content_h))
+        cw = SETTINGS_W - 2 * PAD
+
+        y = PAD
+        root.addSubview_(make_label(NSMakeRect(PAD, y, cw, 18), "Notificações", size=13, bold=True))
+        y += SETTINGS_SECTION_H
+        y = self._add_switch_row(root, y, "notifications_enabled", "Todas as notificações")
+        for key, label in SETTINGS_LEVEL_ROWS:
+            y = self._add_switch_row(root, y, f"lvl:{key}", label, indent=True)
+            y = self._add_message_field(root, y, key)
+
+        root.addSubview_(make_label(NSMakeRect(PAD, y, cw, 18), "Som", size=13, bold=True))
+        y += SETTINGS_SECTION_H
+        y = self._add_switch_row(root, y, "sound_enabled", "Som de notificação (desligue para silenciar)")
+        root.addSubview_(
+            make_wrapping_label(
+                NSMakeRect(PAD, y + 2, cw, 30),
+                "Nas mensagens você pode usar {nome}, {pct} e {reset}. "
+                "Apague o texto para voltar à mensagem padrão.",
+                11, NSColor.tertiaryLabelColor(),
+            )
+        )
+        y += 34
+
+        claude_raw = read_claude_settings() or {}
+        root.addSubview_(make_label(NSMakeRect(PAD, y, cw, 18), "Claude Code", size=13, bold=True))
+        y += SETTINGS_SECTION_H
+        y = self._add_popup_row(
+            root, y, "claude:model", "Modelo padrão", MODEL_CHOICES, claude_raw.get("model")
+        )
+        y = self._add_popup_row(
+            root, y, "claude:effortLevel", "Effort padrão", EFFORT_CHOICES, claude_raw.get("effortLevel")
+        )
+        y = self._add_switch_row(
+            root, y, "claudebool:ultracode", "Ultracode (xhigh + orquestração multiagente)"
+        )
+        self._controls["claudebool:ultracode"].setState_(
+            1 if claude_raw.get("ultracode") is True else 0
+        )
+        root.addSubview_(
+            make_wrapping_label(
+                NSMakeRect(PAD, y + 2, cw, 30),
+                "Vale para novas sessões do Claude Code. Na sessão já aberta, "
+                "use /model e /effort dentro dela.",
+                11, NSColor.tertiaryLabelColor(),
+            )
+        )
+
+        self._settings_window.setContentSize_((SETTINGS_W, content_h))
+        self._settings_window.setContentView_(root)
+        self._sync_settings_controls()
+
+    def _sync_settings_controls(self):
+        """Push persisted values into the controls and grey out muted rows."""
+        master_on = self._settings["notifications_enabled"]
+        self._controls["notifications_enabled"].setState_(1 if master_on else 0)
+        self._controls["sound_enabled"].setState_(1 if self._settings["sound_enabled"] else 0)
+        self._controls["sound_enabled"].setEnabled_(master_on)
+        for key, _label in SETTINGS_LEVEL_ROWS:
+            level = self._settings["levels"][key]
+            switch = self._controls[f"lvl:{key}"]
+            switch.setState_(1 if level["enabled"] else 0)
+            switch.setEnabled_(master_on)
+            self._controls[f"msg:{key}"].setEnabled_(master_on and level["enabled"])
+
+    def _on_control_changed(self, sender):
+        """Persist a switch/field change and re-grey dependent controls."""
+        ident = str(sender.identifier())
+        if ident.startswith("claudebool:"):
+            # On -> true; off -> remove the key (same as the CLI's own default).
+            value = True if sender.state() == 1 else None
+            if not set_claude_option(ident[11:], value):
+                self._stale = "Não foi possível alterar o settings.json do Claude Code"
+                self._render()
+            return
+        if ident.startswith("claude:"):
+            value = self._popup_values[ident][sender.indexOfSelectedItem()]
+            if not set_claude_option(ident[7:], value):
+                self._stale = "Não foi possível alterar o settings.json do Claude Code"
+                self._render()
+            return
+        if ident.startswith("msg:"):
+            self._settings = update_level(
+                self._settings, ident[4:], message=str(sender.stringValue()).strip()
+            )
+        elif ident.startswith("lvl:"):
+            self._settings = update_level(self._settings, ident[4:], enabled=sender.state() == 1)
+        else:
+            self._settings = update_setting(self._settings, ident, sender.state() == 1)
+        if not save_settings(self._settings):
+            self._stale = "Não foi possível salvar as configurações"
+            self._render()
+        self._sync_settings_controls()
 
     # --- window ---
     def _build_window(self):
