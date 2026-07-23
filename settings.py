@@ -7,6 +7,7 @@ Settings live in ~/Library/Application Support/claude-usage-monitor/.
 Schema:
     notifications_enabled  bool  master switch for every alert
     sound_enabled          bool  audible cue on/off (off = silenciar)
+    window_pinned          bool  keep the monitor window always on top
     levels                 dict  per-alert config keyed by level id:
         enabled            bool  fire this alert or not
         message            str   custom message; "" means "use the default"
@@ -39,6 +40,7 @@ DEFAULT_MESSAGES = {
 DEFAULT_SETTINGS = {
     "notifications_enabled": True,
     "sound_enabled": True,
+    "window_pinned": False,
     "levels": {key: {"enabled": True, "message": ""} for key in LEVEL_KEYS},
 }
 
@@ -68,9 +70,11 @@ def load_settings(path=SETTINGS_PATH):
 
     notif = raw.get("notifications_enabled")
     sound = raw.get("sound_enabled")
+    pinned = raw.get("window_pinned")
     return {
         "notifications_enabled": notif if isinstance(notif, bool) else True,
         "sound_enabled": sound if isinstance(sound, bool) else True,
+        "window_pinned": pinned if isinstance(pinned, bool) else False,
         "levels": {key: _merged_level(raw.get("levels"), key) for key in LEVEL_KEYS},
     }
 
@@ -88,7 +92,7 @@ def save_settings(settings, path=SETTINGS_PATH):
 
 def update_setting(settings, key, value):
     """New settings dict with top-level bool `key` set (immutable update)."""
-    if key not in ("notifications_enabled", "sound_enabled"):
+    if key not in ("notifications_enabled", "sound_enabled", "window_pinned"):
         return dict(settings)
     return {**settings, key: bool(value)}
 

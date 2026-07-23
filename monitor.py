@@ -32,12 +32,15 @@ from AppKit import (
     NSApplicationActivationPolicyAccessory,
     NSBackingStoreBuffered,
     NSBezierPath,
+    NSButton,
     NSColor,
+    NSFloatingWindowLevel,
     NSFont,
     NSImage,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
     NSLineBreakByWordWrapping,
+    NSNormalWindowLevel,
     NSPanel,
     NSPopUpButton,
     NSScreen,
@@ -316,6 +319,26 @@ def make_label(frame, text, size=13, bold=False, color=None, align_right=False):
     if align_right:
         lbl.setAlignment_(NSTextAlignmentRight)
     return lbl
+
+
+PIN_DIMMED_ALPHA = 0.35  # faded look for the pin button while unpinned
+
+
+def make_pin_button(frame, pinned, target):
+    """The 📌 toggle in the window header: solid when pinned, faded when not."""
+    btn = NSButton.alloc().initWithFrame_(frame)
+    btn.setTitle_("📌")
+    btn.setBordered_(False)
+    btn.setFont_(NSFont.systemFontOfSize_(15))
+    btn.setAlphaValue_(1.0 if pinned else PIN_DIMMED_ALPHA)
+    btn.setToolTip_(
+        "Desafixar (deixa de ficar sempre visível)"
+        if pinned
+        else "Fixar janela sempre por cima de tudo"
+    )
+    btn.setTarget_(target)
+    btn.setAction_("controlChanged:")
+    return btn
 
 
 def make_bar(frame, percent, color):
@@ -989,6 +1012,32 @@ class UsageMonitor(rumps.App):
         win.setReleasedWhenClosed_(False)
         win.center()
         self._window = win
+        self._pin_target = ControlTarget.alloc().initWithHandler_(self._on_pin_toggled)
+        self._apply_pin_state()
+
+    def _apply_pin_state(self):
+        """Float the monitor window above everything (all apps and spaces) when pinned."""
+        if self._window is None:
+            return
+        if self._settings["window_pinned"]:
+            self._window.setLevel_(NSFloatingWindowLevel)
+            self._window.setCollectionBehavior_(
+                NSWindowCollectionBehaviorCanJoinAllSpaces
+                | NSWindowCollectionBehaviorFullScreenAuxiliary
+            )
+        else:
+            self._window.setLevel_(NSNormalWindowLevel)
+            self._window.setCollectionBehavior_(0)
+
+    def _on_pin_toggled(self, _sender):
+        """Toggle always-on-top, persist the choice and update the button look."""
+        self._settings = update_setting(
+            self._settings, "window_pinned", not self._settings["window_pinned"]
+        )
+        if not save_settings(self._settings):
+            self._stale = "Não foi possível salvar as configurações"
+        self._apply_pin_state()
+        self._refresh_window()
 
     def _refresh_window(self):
         if self._window is None:
@@ -1013,7 +1062,14 @@ class UsageMonitor(rumps.App):
         logo.setImage_(load_logo(26))
         root.addSubview_(logo)
         root.addSubview_(
-            make_label(NSMakeRect(PAD + 34, PAD + 3, cw - 34, 20), "Claude Usage", size=15, bold=True)
+            make_label(NSMakeRect(PAD + 34, PAD + 3, cw - 34 - 32, 20), "Claude Usage", size=15, bold=True)
+        )
+        root.addSubview_(
+            make_pin_button(
+                NSMakeRect(WIN_W - PAD - 26, PAD + 1, 26, 24),
+                self._settings["window_pinned"],
+                self._pin_target,
+            )
         )
 
         # One row per quota.

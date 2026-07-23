@@ -75,6 +75,37 @@ class LoadSettingsTest(unittest.TestCase):
         self.assertEqual(loaded["levels"]["alert_90"]["message"], "")
 
 
+class WindowPinnedTest(unittest.TestCase):
+    def test_defaults_to_false(self):
+        self.assertFalse(DEFAULT_SETTINGS["window_pinned"])
+
+    def test_load_settings_reads_persisted_value(self):
+        # Arrange
+        path = os.path.join(tempfile.mkdtemp(), "settings.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"window_pinned": True}, fh)
+
+        # Act / Assert
+        self.assertTrue(load_settings(path)["window_pinned"])
+
+    def test_load_settings_coerces_invalid_value_to_false(self):
+        # Arrange
+        path = os.path.join(tempfile.mkdtemp(), "settings.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"window_pinned": "yes"}, fh)
+
+        # Act / Assert
+        self.assertFalse(load_settings(path)["window_pinned"])
+
+    def test_update_setting_toggles_without_mutating_original(self):
+        # Act
+        updated = update_setting(DEFAULT_SETTINGS, "window_pinned", True)
+
+        # Assert
+        self.assertTrue(updated["window_pinned"])
+        self.assertFalse(DEFAULT_SETTINGS["window_pinned"])
+
+
 class SaveSettingsTest(unittest.TestCase):
     def test_round_trips_through_disk(self):
         # Arrange
