@@ -9,6 +9,7 @@ in sync when Claude Code rotates it.
 """
 
 import json
+import math
 import os
 import ssl
 import subprocess
@@ -27,7 +28,9 @@ import rumps
 warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
 from AppKit import (
     NSApplication,
+    NSApplicationActivationPolicyAccessory,
     NSBackingStoreBuffered,
+    NSBezierPath,
     NSColor,
     NSFont,
     NSImage,
@@ -41,7 +44,12 @@ from AppKit import (
     NSWindowStyleMaskMiniaturizable,
     NSWindowStyleMaskTitled,
 )
-from Foundation import NSMakeRect
+from Foundation import NSMakeRect, NSTimer
+
+# CoreAnimation classes are registered at runtime by AppKit but pyobjc has no
+# import binding for them, so look them up dynamically for the confetti burst.
+CAEmitterLayer = objc.lookUpClass("CAEmitterLayer")
+CAEmitterCell = objc.lookUpClass("CAEmitterCell")
 
 # --- Constants ---------------------------------------------------------------
 USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
@@ -54,6 +62,22 @@ HTTP_TIMEOUT = 15
 # Percentage thresholds for the colored bars.
 WARN_THRESHOLD = 70
 CRIT_THRESHOLD = 90
+
+# Alert thresholds (percent) that trigger notifications when first crossed.
+TIP_THRESHOLD = 80    # gentle tip: save tokens
+ALERT_THRESHOLD = 90  # push + sound: close to the limit
+LIMIT_THRESHOLD = 100  # push + sound: limit reached
+# A drop of at least this many points between refreshes means the window
+# renewed (quota is back) — worth celebrating with confetti.
+RESET_DROP = 20
+
+# System sounds played alongside each alert (paths always present on macOS).
+ALERT_SOUND = "/System/Library/Sounds/Glass.aiff"
+LIMIT_SOUND = "/System/Library/Sounds/Sosumi.aiff"
+CELEBRATE_SOUND = "/System/Library/Sounds/Hero.aiff"
+
+# Portuguese weekday abbreviations (Mon=0), used when a reset is not today.
+PT_WEEKDAYS = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
 
 # Default backoff (seconds) when the endpoint returns 429 without Retry-After.
 DEFAULT_RETRY_AFTER = 120
@@ -125,6 +149,44 @@ def format_reset(resets_at):
     return f"{minutes}m"
 
 
+def reset_local(resets_at):
+    """Parse the ISO reset timestamp into a local-timezone datetime, or None."""
+    if not resets_at:
+        return None
+    try:
+        return datetime.fromisoformat(resets_at).astimezone()
+    except ValueError:
+        return None
+
+
+def clock_suffix(resets_at):
+    """Wall-clock time of the reset, e.g. '14:30' or 'ter 14:30' if not today."""
+    local = reset_local(resets_at)
+    if local is None:
+        return ""
+    now = datetime.now().astimezone()
+    if local.date() == now.date():
+        return local.strftime("%H:%M")
+    return f"{PT_WEEKDAYS[local.weekday()]} {local.strftime('%H:%M')}"
+
+
+# --- Notifications -----------------------------------------------------------
+def notify(title, message, sound=None):
+    """Show a macOS notification banner (and optionally play a system sound).
+
+    Uses osascript so the banner appears reliably even when the app runs
+    unbundled from a virtualenv. Everything is fire-and-forget (Popen) so the
+    menu bar loop never blocks on the UI.
+    """
+    script = f"display notification {json.dumps(message)} with title {json.dumps(title)}"
+    try:
+        subprocess.Popen(["osascript", "-e", script])
+        if sound:
+            subprocess.Popen(["afplay", sound])
+    except OSError:
+        pass  # never let a missing binary crash the menu bar
+
+
 def limit_name(item):
     """Readable name for one limit entry."""
     kind = item.get("kind", "")
@@ -142,7 +204,9 @@ def limit_label(item):
     """Full one-line label used in the dropdown menu."""
     pct = item.get("percent", 0)
     reset = format_reset(item.get("resets_at"))
-    return f"{limit_name(item)}: {pct}%  ·  reseta em {reset}"
+    clock = clock_suffix(item.get("resets_at"))
+    when = f"{reset} · {clock}" if clock else reset
+    return f"{limit_name(item)}: {pct}%  ·  reseta em {when}"
 
 
 def compact_title(limits):
@@ -219,6 +283,66 @@ def make_bar(frame, percent, color):
     return track
 
 
+# --- Confetti ----------------------------------------------------------------
+_PARTICLE_IMAGE = None
+
+
+def confetti_particle():
+    """A small white rounded-rect CGImage, tinted per-cell into confetti."""
+    global _PARTICLE_IMAGE
+    if _PARTICLE_IMAGE is not None:
+        return _PARTICLE_IMAGE
+    size = 10.0
+    img = NSImage.alloc().initWithSize_((size, size))
+    img.lockFocus()
+    NSColor.whiteColor().set()
+    NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+        NSMakeRect(1, 2, 8, 5), 1.5, 1.5
+    ).fill()
+    img.unlockFocus()
+    _PARTICLE_IMAGE = img.CGImageForProposedRect_context_hints_(None, None, None)
+    return _PARTICLE_IMAGE
+
+
+def _confetti_cell(color):
+    """One colored confetti stream falling downward with spin and fade."""
+    cell = CAEmitterCell.alloc().init()
+    cell.setContents_(confetti_particle())
+    cell.setColor_(color.CGColor())
+    cell.setBirthRate_(9.0)
+    cell.setLifetime_(4.0)
+    cell.setLifetimeRange_(1.0)
+    cell.setVelocity_(170.0)
+    cell.setVelocityRange_(70.0)
+    cell.setEmissionLongitude_(-math.pi / 2)  # aim down (layer y grows upward)
+    cell.setEmissionRange_(math.pi / 5)
+    cell.setYAcceleration_(-220.0)  # gravity pulls toward the bottom
+    cell.setSpin_(3.5)
+    cell.setSpinRange_(5.0)
+    cell.setScale_(0.9)
+    cell.setScaleRange_(0.5)
+    cell.setScaleSpeed_(-0.05)
+    cell.setAlphaSpeed_(-0.18)
+    return cell
+
+
+def build_confetti_emitter(width, height):
+    """A CAEmitterLayer that rains confetti from the top edge of a view."""
+    palette = [
+        NSColor.systemRedColor(), NSColor.systemOrangeColor(),
+        NSColor.systemYellowColor(), NSColor.systemGreenColor(),
+        NSColor.systemBlueColor(), NSColor.systemPurpleColor(),
+        NSColor.systemPinkColor(),
+    ]
+    emitter = CAEmitterLayer.layer()
+    emitter.setEmitterPosition_((width / 2.0, height))
+    emitter.setEmitterSize_((width, 1.0))
+    emitter.setEmitterShape_("line")
+    emitter.setEmitterMode_("outline")
+    emitter.setEmitterCells_([_confetti_cell(c) for c in palette])
+    return emitter
+
+
 # --- App ---------------------------------------------------------------------
 class UsageMonitor(rumps.App):
     def __init__(self):
@@ -230,6 +354,12 @@ class UsageMonitor(rumps.App):
         self._extra_line = None
         self._stale = None
         self._retry_after_ts = 0.0
+        self._prev_percents = {}  # kind -> last seen percent, for edge alerts
+        # Run as an accessory app: no Dock icon (so it can't be closed by
+        # accident) and no generic "Python" name — it lives in the menu bar only.
+        NSApplication.sharedApplication().setActivationPolicy_(
+            NSApplicationActivationPolicyAccessory
+        )
         self.menu = ["Abrir monitor", "Atualizar agora", None, "Sair"]
         self.timer = rumps.Timer(self.refresh, REFRESH_SECONDS)
         self.timer.start()
@@ -238,6 +368,9 @@ class UsageMonitor(rumps.App):
     # --- menu actions ---
     @rumps.clicked("Abrir monitor")
     def open_monitor(self, _):
+        self._present_window()
+
+    def _present_window(self):
         if self._window is None:
             self._build_window()
         self._refresh_window()
@@ -295,7 +428,80 @@ class UsageMonitor(rumps.App):
         else:
             self._extra_line = None
         self._stale = None
+        self._check_alerts()
         self._render()
+
+    # --- alerts ---
+    def _check_alerts(self):
+        """Fire threshold notifications and reset confetti on state changes.
+
+        Compares each limit's current percent against the value seen on the
+        previous refresh so an alert fires once, on the crossing, not on every
+        poll. The very first refresh only records a baseline (no alerts).
+        """
+        had_baseline = bool(self._prev_percents)
+        celebrated = False
+        for item in self._limits:
+            kind = item.get("kind")
+            pct = item.get("percent", 0) or 0
+            prev = self._prev_percents.get(kind)
+            self._prev_percents[kind] = pct
+            if prev is None or not had_baseline:
+                continue
+            if prev - pct >= RESET_DROP and not celebrated:
+                celebrated = True
+                self._on_reset(item)
+            else:
+                self._on_threshold(item, prev, pct)
+
+    def _on_threshold(self, item, prev, pct):
+        """Notify when a limit first crosses 80 / 90 / 100%."""
+        name = limit_name(item)
+        if prev < LIMIT_THRESHOLD <= pct:
+            reset = format_reset(item.get("resets_at"))
+            notify(f"🚫 {name} no limite", f"Uso em {pct}%. Renova em {reset}.", LIMIT_SOUND)
+            self._present_window()
+        elif prev < ALERT_THRESHOLD <= pct:
+            notify(
+                f"⚠️ {name} em {pct}%",
+                "Perto do limite — pause tarefas pesadas ou espere a renovação.",
+                ALERT_SOUND,
+            )
+        elif prev < TIP_THRESHOLD <= pct:
+            notify(
+                f"💡 {name} em {pct}%",
+                "Dica: reduza o effort ou troque para um modelo mais leve (ex.: Haiku) para economizar.",
+            )
+
+    def _on_reset(self, item):
+        """Celebrate a renewed window with a notification and confetti."""
+        name = limit_name(item)
+        notify(f"🎉 {name} renovada!", "Sua janela voltou — quota disponível de novo.", CELEBRATE_SOUND)
+        self._present_window()
+        self._celebrate()
+
+    def _celebrate(self):
+        """Rain confetti over the monitor window for a few seconds."""
+        if self._window is None:
+            return
+        content = self._window.contentView()
+        if content is None:
+            return
+        bounds = content.bounds()
+        overlay = NSView.alloc().initWithFrame_(bounds)
+        overlay.setWantsLayer_(True)
+        content.addSubview_(overlay)
+        emitter = build_confetti_emitter(bounds.size.width, bounds.size.height)
+        overlay.layer().addSublayer_(emitter)
+
+        def stop(_timer):
+            emitter.setBirthRate_(0.0)  # end the burst; existing pieces keep falling
+
+        def cleanup(_timer):
+            overlay.removeFromSuperview()
+
+        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.6, False, stop)
+        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(5.0, False, cleanup)
 
     def _render(self):
         """Rebuild the menu bar title and dropdown from cached state.
@@ -377,11 +583,13 @@ class UsageMonitor(rumps.App):
             )
         for item in ordered:
             pct = item.get("percent", 0) or 0
-            root.addSubview_(make_label(NSMakeRect(PAD, y, cw * 0.6, 16), limit_name(item), bold=True))
-            stats = f"{pct}%  ·  {format_reset(item.get('resets_at'))}"
+            root.addSubview_(make_label(NSMakeRect(PAD, y, cw * 0.5, 16), limit_name(item), bold=True))
+            reset = format_reset(item.get("resets_at"))
+            clock = clock_suffix(item.get("resets_at"))
+            stats = f"{pct}%  ·  {reset}" + (f"  ·  {clock}" if clock else "")
             root.addSubview_(
                 make_label(
-                    NSMakeRect(PAD + cw * 0.4, y, cw * 0.6, 16), stats,
+                    NSMakeRect(PAD + cw * 0.5, y, cw * 0.5, 16), stats, size=12,
                     color=NSColor.secondaryLabelColor(), align_right=True,
                 )
             )
