@@ -27,6 +27,7 @@ import rumps
 # CGColorRef and warns on every call; silence it to keep the log clean.
 warnings.filterwarnings("ignore", category=objc.ObjCPointerWarning)
 from AppKit import (
+    NSAnimationContext,
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSBackingStoreBuffered,
@@ -36,12 +37,20 @@ from AppKit import (
     NSImage,
     NSImageScaleProportionallyUpOrDown,
     NSImageView,
+    NSLineBreakByWordWrapping,
+    NSPanel,
+    NSScreen,
+    NSStatusWindowLevel,
     NSTextAlignmentRight,
     NSTextField,
     NSView,
     NSWindow,
+    NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowStyleMaskBorderless,
     NSWindowStyleMaskClosable,
     NSWindowStyleMaskMiniaturizable,
+    NSWindowStyleMaskNonactivatingPanel,
     NSWindowStyleMaskTitled,
 )
 from Foundation import NSMakeRect, NSTimer
@@ -64,20 +73,29 @@ WARN_THRESHOLD = 70
 CRIT_THRESHOLD = 90
 
 # Alert thresholds (percent) that trigger notifications when first crossed.
-TIP_THRESHOLD = 80    # gentle tip: save tokens
-ALERT_THRESHOLD = 90  # push + sound: close to the limit
-LIMIT_THRESHOLD = 100  # push + sound: limit reached
+TIP_THRESHOLD = 80      # gentle tip: save tokens
+ALERT_THRESHOLD = 90    # heads-up: getting close
+NEAR_THRESHOLD = 95     # urgent: almost out
+LIMIT_THRESHOLD = 100   # limit reached
 # A drop of at least this many points between refreshes means the window
 # renewed (quota is back) — worth celebrating with confetti.
 RESET_DROP = 20
 
 # System sounds played alongside each alert (paths always present on macOS).
+TIP_SOUND = "/System/Library/Sounds/Tink.aiff"
 ALERT_SOUND = "/System/Library/Sounds/Glass.aiff"
+NEAR_SOUND = "/System/Library/Sounds/Blow.aiff"
 LIMIT_SOUND = "/System/Library/Sounds/Sosumi.aiff"
 CELEBRATE_SOUND = "/System/Library/Sounds/Hero.aiff"
 
 # Portuguese weekday abbreviations (Mon=0), used when a reset is not today.
 PT_WEEKDAYS = ["seg", "ter", "qua", "qui", "sex", "sáb", "dom"]
+
+# In-app toast (the styled card shown for every alert).
+TOAST_W = 360
+TOAST_DURATION = 5.0          # seconds a normal toast stays on screen
+TOAST_CELEBRATE_DURATION = 6.5  # celebrations linger a bit while confetti falls
+TOAST_MARGIN = 16             # gap from the screen edge and between stacked toasts
 
 # Default backoff (seconds) when the endpoint returns 429 without Retry-After.
 DEFAULT_RETRY_AFTER = 120
@@ -171,24 +189,26 @@ def clock_suffix(resets_at):
 
 
 # --- Notifications -----------------------------------------------------------
-def notify(title, message, sound=None):
-    """Show a macOS notification banner (and optionally play a system sound).
-
-    Uses osascript so the banner appears reliably even when the app runs
-    unbundled from a virtualenv. Everything is fire-and-forget (Popen) so the
-    menu bar loop never blocks on the UI.
-    """
-    # ensure_ascii=False keeps accents/em-dashes/emoji as literal UTF-8; the
-    # \uXXXX escapes json emits by default are invalid in AppleScript strings.
-    msg = json.dumps(message, ensure_ascii=False)
-    ttl = json.dumps(title, ensure_ascii=False)
-    script = f"display notification {msg} with title {ttl}"
+def play_sound(path):
+    """Play a system sound without blocking (fire-and-forget)."""
     try:
-        subprocess.Popen(["osascript", "-e", script])
-        if sound:
-            subprocess.Popen(["afplay", sound])
+        subprocess.Popen(["afplay", path])
     except OSError:
         pass  # never let a missing binary crash the menu bar
+
+
+def push_notification(title, message):
+    """Post a macOS notification banner via osascript (fire-and-forget).
+
+    ensure_ascii=False keeps accents/em-dashes/emoji as literal UTF-8 — the
+    \\uXXXX escapes json emits by default are invalid in AppleScript strings.
+    """
+    ttl = json.dumps(title, ensure_ascii=False)
+    msg = json.dumps(message, ensure_ascii=False)
+    try:
+        subprocess.Popen(["osascript", "-e", f"display notification {msg} with title {ttl}"])
+    except OSError:
+        pass
 
 
 def limit_name(item):
@@ -347,6 +367,120 @@ def build_confetti_emitter(width, height):
     return emitter
 
 
+# --- Toast (in-app notification card) ----------------------------------------
+def make_wrapping_label(frame, text, size, color):
+    """A non-editable label that word-wraps within its frame."""
+    lbl = NSTextField.alloc().initWithFrame_(frame)
+    lbl.setStringValue_(text)
+    lbl.setBezeled_(False)
+    lbl.setDrawsBackground_(False)
+    lbl.setEditable_(False)
+    lbl.setSelectable_(False)
+    lbl.setFont_(NSFont.systemFontOfSize_(size))
+    lbl.setTextColor_(color)
+    lbl.setLineBreakMode_(NSLineBreakByWordWrapping)
+    lbl.cell().setWraps_(True)
+    lbl.cell().setScrollable_(False)
+    return lbl
+
+
+def build_toast_card(title, message, accent, width, height):
+    """The rounded card content: accent stripe, logo, title and message."""
+    card = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, width, height))
+    card.setWantsLayer_(True)
+    layer = card.layer()
+    layer.setCornerRadius_(14.0)
+    layer.setMasksToBounds_(True)
+    layer.setBackgroundColor_(NSColor.windowBackgroundColor().CGColor())
+    layer.setBorderWidth_(0.5)
+    layer.setBorderColor_(NSColor.separatorColor().CGColor())
+
+    stripe = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 5, height))
+    stripe.setWantsLayer_(True)
+    stripe.layer().setBackgroundColor_(accent.CGColor())
+    card.addSubview_(stripe)
+
+    logo = NSImageView.alloc().initWithFrame_(NSMakeRect(18, 16, 26, 26))
+    logo.setImageScaling_(NSImageScaleProportionallyUpOrDown)
+    logo.setImage_(load_logo(26))
+    card.addSubview_(logo)
+
+    tx = 56
+    card.addSubview_(make_label(NSMakeRect(tx, 15, width - tx - 16, 20), title, size=14, bold=True))
+    card.addSubview_(
+        make_wrapping_label(
+            NSMakeRect(tx, 38, width - tx - 16, height - 38 - 12),
+            message, 12, NSColor.secondaryLabelColor(),
+        )
+    )
+    return card
+
+
+def build_toast_panel(card, width, height):
+    """A borderless, non-activating floating panel that hosts a toast card."""
+    style = NSWindowStyleMaskBorderless | NSWindowStyleMaskNonactivatingPanel
+    panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+        NSMakeRect(0, 0, width, height), style, NSBackingStoreBuffered, False
+    )
+    panel.setOpaque_(False)
+    panel.setBackgroundColor_(NSColor.clearColor())
+    panel.setHasShadow_(True)
+    panel.setLevel_(NSStatusWindowLevel)
+    panel.setBecomesKeyOnlyIfNeeded_(True)
+    panel.setReleasedWhenClosed_(False)
+    panel.setCollectionBehavior_(
+        NSWindowCollectionBehaviorCanJoinAllSpaces
+        | NSWindowCollectionBehaviorFullScreenAuxiliary
+    )
+    panel.setContentView_(card)
+    return panel
+
+
+def animate_alpha(window, target, duration, done=None):
+    """Fade a window's alpha to `target` over `duration`, then call `done`."""
+    def changes(ctx):
+        ctx.setDuration_(duration)
+        window.animator().setAlphaValue_(target)
+
+    NSAnimationContext.runAnimationGroup_completionHandler_(changes, done or (lambda: None))
+
+
+# --- Alert levels ------------------------------------------------------------
+def deep_orange():
+    """A darker, more urgent orange than systemOrange (used at 95%)."""
+    return NSColor.colorWithCalibratedRed_green_blue_alpha_(0.92, 0.38, 0.05, 1.0)
+
+
+def alert_levels():
+    """Ordered high→low: (threshold, accent, sound, title_fn, message_fn).
+
+    The highest crossed level wins, so a jump from 80→100 fires only the
+    limit alert. Each level has its own emoji, color, sound and copy.
+    """
+    return [
+        (
+            LIMIT_THRESHOLD, NSColor.systemRedColor(), LIMIT_SOUND,
+            lambda name, pct: f"🚫 {name} atingiu o limite",
+            lambda name, pct, reset: f"Uso em {pct}%. Renova em {reset} — pause ou use créditos extras.",
+        ),
+        (
+            NEAR_THRESHOLD, deep_orange(), NEAR_SOUND,
+            lambda name, pct: f"🔥 {name} em {pct}%",
+            lambda name, pct, reset: f"Quase no limite! Segura as tarefas pesadas. Renova em {reset}.",
+        ),
+        (
+            ALERT_THRESHOLD, NSColor.systemOrangeColor(), ALERT_SOUND,
+            lambda name, pct: f"⚠️ {name} em {pct}%",
+            lambda name, pct, reset: f"Chegando perto do limite. Renova em {reset}.",
+        ),
+        (
+            TIP_THRESHOLD, NSColor.systemYellowColor(), TIP_SOUND,
+            lambda name, pct: f"💡 {name} em {pct}%",
+            lambda name, pct, reset: "Dica: reduza o effort ou troque para um modelo mais leve (ex.: Haiku) para economizar.",
+        ),
+    ]
+
+
 # --- App ---------------------------------------------------------------------
 class UsageMonitor(rumps.App):
     def __init__(self):
@@ -359,6 +493,7 @@ class UsageMonitor(rumps.App):
         self._stale = None
         self._retry_after_ts = 0.0
         self._prev_percents = {}  # kind -> last seen percent, for edge alerts
+        self._toasts = []  # live toast panels (kept referenced so ARC won't drop them)
         # Run as an accessory app: no Dock icon (so it can't be closed by
         # accident) and no generic "Python" name — it lives in the menu bar only.
         NSApplication.sharedApplication().setActivationPolicy_(
@@ -459,53 +594,76 @@ class UsageMonitor(rumps.App):
                 self._on_threshold(item, prev, pct)
 
     def _on_threshold(self, item, prev, pct):
-        """Notify when a limit first crosses 80 / 90 / 100%."""
+        """Alert when a limit first crosses 80 / 90 / 95 / 100% (highest wins)."""
         name = limit_name(item)
-        if prev < LIMIT_THRESHOLD <= pct:
-            reset = format_reset(item.get("resets_at"))
-            notify(f"🚫 {name} no limite", f"Uso em {pct}%. Renova em {reset}.", LIMIT_SOUND)
-            self._present_window()
-        elif prev < ALERT_THRESHOLD <= pct:
-            notify(
-                f"⚠️ {name} em {pct}%",
-                "Perto do limite — pause tarefas pesadas ou espere a renovação.",
-                ALERT_SOUND,
-            )
-        elif prev < TIP_THRESHOLD <= pct:
-            notify(
-                f"💡 {name} em {pct}%",
-                "Dica: reduza o effort ou troque para um modelo mais leve (ex.: Haiku) para economizar.",
-            )
+        reset = format_reset(item.get("resets_at"))
+        for at, accent, sound, title_fn, msg_fn in alert_levels():
+            if prev < at <= pct:
+                self._show_toast(title_fn(name, pct), msg_fn(name, pct, reset), accent, sound=sound)
+                return
 
     def _on_reset(self, item):
-        """Celebrate a renewed window with a notification and confetti."""
+        """Celebrate a renewed window with a confetti toast."""
         name = limit_name(item)
-        notify(f"🎉 {name} renovada!", "Sua janela voltou — quota disponível de novo.", CELEBRATE_SOUND)
-        self._present_window()
-        self._celebrate()
+        self._show_toast(
+            f"🎉 {name} renovada!", "Sua janela voltou — quota disponível de novo.",
+            NSColor.systemGreenColor(), sound=CELEBRATE_SOUND, confetti=True,
+        )
 
-    def _celebrate(self):
-        """Rain confetti over the monitor window for a few seconds."""
-        if self._window is None:
-            return
-        content = self._window.contentView()
-        if content is None:
-            return
-        bounds = content.bounds()
-        overlay = NSView.alloc().initWithFrame_(bounds)
-        overlay.setWantsLayer_(True)
-        content.addSubview_(overlay)
-        emitter = build_confetti_emitter(bounds.size.width, bounds.size.height)
-        overlay.layer().addSublayer_(emitter)
+    # --- toast presentation ---
+    def _show_toast(self, title, message, accent, sound=None, confetti=False, push=True):
+        """Fire all three channels at once: in-app card + OS push + sound.
 
-        def stop(_timer):
-            emitter.setBirthRate_(0.0)  # end the burst; existing pieces keep falling
+        The card is the branded on-screen experience; the push banner is the
+        native notification (also shows in Notification Center); the sound is
+        the audible cue. Every alert uses all three.
+        """
+        if push:
+            push_notification(title, message)
+        if sound:
+            play_sound(sound)
 
-        def cleanup(_timer):
-            overlay.removeFromSuperview()
+        width = TOAST_W
+        height = 168 if confetti else 94
+        card = build_toast_card(title, message, accent, width, height)
+        panel = build_toast_panel(card, width, height)
 
-        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.6, False, stop)
-        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(5.0, False, cleanup)
+        screen = NSScreen.mainScreen()
+        vf = screen.visibleFrame() if screen else NSMakeRect(0, 0, 1440, 900)
+        offset = len(self._toasts) * (height + 10)
+        x = vf.origin.x + vf.size.width - width - TOAST_MARGIN
+        y = vf.origin.y + vf.size.height - height - TOAST_MARGIN - offset
+        panel.setFrameOrigin_((x, y))
+
+        panel.setAlphaValue_(0.0)
+        panel.orderFrontRegardless()
+        self._toasts.append(panel)
+        animate_alpha(panel, 1.0, 0.22)
+
+        if confetti:
+            bounds = card.bounds()
+            overlay = NSView.alloc().initWithFrame_(bounds)
+            overlay.setWantsLayer_(True)
+            card.addSubview_(overlay)
+            emitter = build_confetti_emitter(bounds.size.width, bounds.size.height)
+            overlay.layer().addSublayer_(emitter)
+            NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+                0.7, False, lambda _t: emitter.setBirthRate_(0.0)
+            )
+
+        duration = TOAST_CELEBRATE_DURATION if confetti else TOAST_DURATION
+        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(
+            duration, False, lambda _t: self._dismiss_toast(panel)
+        )
+
+    def _dismiss_toast(self, panel):
+        """Fade the toast out and drop our reference to it."""
+        def done():
+            if panel in self._toasts:
+                self._toasts.remove(panel)
+            panel.orderOut_(None)
+
+        animate_alpha(panel, 0.0, 0.35, done)
 
     def _render(self):
         """Rebuild the menu bar title and dropdown from cached state.
