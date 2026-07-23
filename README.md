@@ -22,6 +22,34 @@ anywhere except in the `Authorization` header to `api.anthropic.com`.
 > Inspired by [usage-monitor-for-claude](https://github.com/jens-duttke/usage-monitor-for-claude)
 > (a Windows tray app) — this is a native macOS menu bar equivalent.
 
+## ✨ Our differentiator: smart, delightful alerts
+
+Other monitors just show a number. **This one talks to you at the exact moments
+that matter** — and does it beautifully. Every alert fires **three channels at
+once**: an on-screen **card**, a native macOS **push notification**, and a
+distinct **sound**. No more discovering you hit the wall mid-task.
+
+<p align="center">
+  <img src="assets/alerts.png" alt="Escalating alert cards at 80%, 90%, 95% and 100%" width="380">
+</p>
+
+| At    | Card            | What it tells you                                                     |
+| ----- | --------------- | --------------------------------------------------------------------- |
+| **80%**  | 💡 yellow    | Money-saving tip: *reduce the effort or switch to a lighter model (e.g. Haiku)* |
+| **90%**  | ⚠️ orange    | Heads-up — you're getting close, with the reset countdown              |
+| **95%**  | 🔥 deep orange | Urgent — *almost out, hold the heavy tasks*                          |
+| **100%** | 🚫 red       | Limit reached — pause or use extra credits                            |
+
+And when your window **renews**, it celebrates — a green card with **confetti**
+and the exact time your quota came back:
+
+<p align="center">
+  <img src="assets/renewed.png" alt="Session renewed card with confetti" width="380">
+</p>
+
+Reset info now shows the **actual clock time** too (e.g. `reseta em 2h 13m · 23:51`),
+not just a countdown — so you know *when*, not only *how long*.
+
 ## Features
 
 - **Always in the menu bar** — the Claude logo plus a compact `S45% W42%`
@@ -30,6 +58,11 @@ anywhere except in the `Authorization` header to `api.anthropic.com`.
   progress bar per quota (🟢 `<70%` · 🟠 `70–90%` · 🔴 `>90%`), the current
   percentage, and a countdown to each reset.
 - **Dropdown summary** — every active quota and reset time at a glance.
+- **Smart alerts** — card + push + sound at 80 / 90 / 95 / 100%, plus a confetti
+  celebration when a window renews (see [the differentiator above](#-our-differentiator-smart-delightful-alerts)).
+- **Reset clock time** — reset info shows the real time of day, not just a countdown.
+- **Out of the Dock** — runs as a menu-bar-only accessory app (no Dock icon to
+  close by accident, no generic "Python" name).
 - **Rate-limit friendly** — keeps showing the last known values on a `429` and
   backs off using the server's `Retry-After` (never wipes the numbers).
 - **Starts at login** — installed as a LaunchAgent that auto-starts and restarts.
@@ -129,7 +162,11 @@ It recovers on its own — no action needed. To reduce how often it appears, rai
 Edit the constants at the top of `monitor.py`:
 
 - `REFRESH_SECONDS` — polling interval (default `90`)
-- `WARN_THRESHOLD` / `CRIT_THRESHOLD` — the 🟠 / 🔴 cutoffs (default `70` / `90`)
+- `WARN_THRESHOLD` / `CRIT_THRESHOLD` — the 🟠 / 🔴 progress-bar cutoffs (default `70` / `90`)
+- `TIP_THRESHOLD` / `ALERT_THRESHOLD` / `NEAR_THRESHOLD` / `LIMIT_THRESHOLD` —
+  the alert levels (default `80` / `90` / `95` / `100`)
+- `RESET_DROP` — percentage drop that counts as a window renewal → confetti (default `20`)
+- `*_SOUND` — the system sound for each alert level (any `/System/Library/Sounds/*.aiff`)
 - `DEFAULT_RETRY_AFTER` — backoff when a `429` has no `Retry-After` (default `120`)
 
 Restart the app after editing — re-run `./install.sh`, or:
