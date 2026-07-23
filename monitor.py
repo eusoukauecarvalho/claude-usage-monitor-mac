@@ -178,7 +178,11 @@ def notify(title, message, sound=None):
     unbundled from a virtualenv. Everything is fire-and-forget (Popen) so the
     menu bar loop never blocks on the UI.
     """
-    script = f"display notification {json.dumps(message)} with title {json.dumps(title)}"
+    # ensure_ascii=False keeps accents/em-dashes/emoji as literal UTF-8; the
+    # \uXXXX escapes json emits by default are invalid in AppleScript strings.
+    msg = json.dumps(message, ensure_ascii=False)
+    ttl = json.dumps(title, ensure_ascii=False)
+    script = f"display notification {msg} with title {ttl}"
     try:
         subprocess.Popen(["osascript", "-e", script])
         if sound:
