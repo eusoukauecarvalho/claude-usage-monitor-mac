@@ -24,8 +24,12 @@ SETTINGS_DIR = os.path.expanduser(
 )
 SETTINGS_PATH = os.path.join(SETTINGS_DIR, "settings.json")
 
-# Ids of every alert level, in escalation order (renewal last).
-LEVEL_KEYS = ["alert_70", "alert_80", "alert_90", "alert_95", "alert_100", "renewal"]
+# Ids of every alert level, in escalation order: usage thresholds, the renewal
+# confetti, then the time-until-renewal countdown marks (1h → 2min).
+LEVEL_KEYS = [
+    "alert_70", "alert_80", "alert_90", "alert_95", "alert_100", "renewal",
+    "renew_60", "renew_30", "renew_15", "renew_5", "renew_2",
+]
 
 # Default (Portuguese) message per level — used whenever the custom one is "".
 DEFAULT_MESSAGES = {
@@ -35,6 +39,11 @@ DEFAULT_MESSAGES = {
     "alert_95": "Quase no limite! Segura as tarefas pesadas. Renova em {reset}.",
     "alert_100": "Uso em {pct}%. Renova em {reset} — pause ou use créditos extras.",
     "renewal": "Sua janela voltou — quota disponível de novo.",
+    "renew_60": "{nome} renova em cerca de 1 hora ({reset}). Uso atual: {pct}%.",
+    "renew_30": "Faltam ~30 min para {nome} renovar. Uso atual: {pct}%.",
+    "renew_15": "Faltam ~15 min para {nome} renovar.",
+    "renew_5": "Quase lá: ~5 min para {nome} renovar.",
+    "renew_2": "~2 min para {nome} renovar — já já a quota volta. 🚀",
 }
 
 DEFAULT_SETTINGS = {

@@ -13,6 +13,7 @@ import math
 import os
 import ssl
 import subprocess
+import sys
 import time
 import warnings
 from datetime import datetime, timezone
@@ -44,6 +45,7 @@ from AppKit import (
     NSPanel,
     NSPopUpButton,
     NSScreen,
+    NSScrollView,
     NSStatusWindowLevel,
     NSSwitch,
     NSTextAlignmentRight,
@@ -194,6 +196,18 @@ def format_reset(resets_at):
     if hours:
         return f"{hours}h {minutes}m"
     return f"{minutes}m"
+
+
+def reset_seconds(resets_at):
+    """Whole seconds until the reset time, or None if unknown/invalid/past."""
+    if not resets_at:
+        return None
+    try:
+        reset = datetime.fromisoformat(resets_at)
+    except ValueError:
+        return None
+    total = int((reset - datetime.now(timezone.utc)).total_seconds())
+    return total if total > 0 else None
 
 
 def reset_local(resets_at):
@@ -531,6 +545,23 @@ def alert_levels():
     ]
 
 
+def reset_countdown_levels():
+    """Ordered far→near: (minutes, key, label, accent, sound).
+
+    Fires as the time left in a window counts down past 1h/30/15/5/2 min.
+    Independent of usage percent — it is purely about how soon the window
+    renews. The nearest crossed mark wins, so a long gap between polls only
+    surfaces the most urgent one.
+    """
+    return [
+        (60, "renew_60", "1 hora", NSColor.systemBlueColor(), EARLY_SOUND),
+        (30, "renew_30", "30 min", NSColor.systemTealColor(), TIP_SOUND),
+        (15, "renew_15", "15 min", NSColor.systemYellowColor(), ALERT_SOUND),
+        (5, "renew_5", "5 min", NSColor.systemOrangeColor(), NEAR_SOUND),
+        (2, "renew_2", "2 min", NSColor.systemRedColor(), LIMIT_SOUND),
+    ]
+
+
 # --- Settings window ----------------------------------------------------------
 # (level_key, label) blocks shown in the settings window, one per alert.
 SETTINGS_LEVEL_ROWS = [
@@ -540,6 +571,11 @@ SETTINGS_LEVEL_ROWS = [
     ("alert_95", "Alerta em 95%"),
     ("alert_100", "Alerta em 100% (limite)"),
     ("renewal", "Sessão renovada 🎉"),
+    ("renew_60", "Renova em 1 hora"),
+    ("renew_30", "Renova em 30 min"),
+    ("renew_15", "Renova em 15 min"),
+    ("renew_5", "Renova em 5 min"),
+    ("renew_2", "Renova em 2 min"),
 ]
 
 
@@ -583,6 +619,7 @@ class UsageMonitor(rumps.App):
         self._stale = None
         self._retry_after_ts = 0.0
         self._prev_percents = {}  # kind -> last seen percent, for edge alerts
+        self._prev_reset = {}  # kind -> (resets_at, seconds_left), for countdown alerts
         self._toasts = []  # live toast panels (kept referenced so ARC won't drop them)
         self._settings = load_settings()
         self._settings_window = None
@@ -594,7 +631,7 @@ class UsageMonitor(rumps.App):
         NSApplication.sharedApplication().setActivationPolicy_(
             NSApplicationActivationPolicyAccessory
         )
-        self.menu = ["Abrir monitor", "Atualizar agora", None, "Configurações", None, "Sair"]
+        self.menu = ["Abrir monitor", "Atualizar agora", None, "Configurações", None, "Reiniciar", "Sair"]
         self.timer = rumps.Timer(self.refresh, REFRESH_SECONDS)
         self.timer.start()
         self.refresh(None)
@@ -619,6 +656,20 @@ class UsageMonitor(rumps.App):
     def manual_refresh(self, _):
         self._retry_after_ts = 0.0  # user asked explicitly: bypass any backoff
         self.refresh(None)
+
+    @rumps.clicked("Reiniciar")
+    def restart_app(self, _):
+        """Relaunch in place so fresh code/settings load.
+
+        os.execv replaces this process image with a new one, keeping the same
+        PID — so launchd goes on managing it and no duplicate icon appears. If
+        the exec fails for any reason, fall back to a plain quit (KeepAlive in
+        the LaunchAgent then respawns it).
+        """
+        try:
+            os.execv(sys.executable, [sys.executable] + sys.argv)
+        except OSError:
+            rumps.quit_application()
 
     @rumps.clicked("Sair")
     def quit_app(self, _):
@@ -684,6 +735,11 @@ class UsageMonitor(rumps.App):
             pct = item.get("percent", 0) or 0
             prev = self._prev_percents.get(kind)
             self._prev_percents[kind] = pct
+
+            # Time-until-renewal alerts are independent of usage percent, so
+            # they track their own baseline and fire even at low usage.
+            self._track_reset_countdown(item, kind)
+
             if prev is None or not had_baseline:
                 continue
             if prev - pct >= RESET_DROP and not celebrated:
@@ -691,6 +747,25 @@ class UsageMonitor(rumps.App):
                 self._on_reset(item)
             else:
                 self._on_threshold(item, prev, pct)
+
+    def _track_reset_countdown(self, item, kind):
+        """Fire a countdown alert as a window's time-left crosses a mark.
+
+        Compares the seconds-until-reset against the value seen last poll and
+        fires once per crossing. A changed `resets_at` (first sight or a
+        freshly renewed window) only re-baselines, so renewal never triggers a
+        false countdown.
+        """
+        resets_at = item.get("resets_at")
+        cur_secs = reset_seconds(resets_at)
+        prev = self._prev_reset.get(kind)
+        self._prev_reset[kind] = (resets_at, cur_secs)
+        if cur_secs is None or prev is None:
+            return
+        prev_at, prev_secs = prev
+        if prev_at != resets_at or prev_secs is None:
+            return
+        self._on_reset_countdown(item, prev_secs, cur_secs)
 
     def _on_threshold(self, item, prev, pct):
         """Alert when a limit first crosses 70 / 80 / 90 / 95 / 100% (highest wins).
@@ -723,6 +798,26 @@ class UsageMonitor(rumps.App):
             f"🎉 {name} renovada!", message,
             NSColor.systemGreenColor(), sound=CELEBRATE_SOUND, confetti=True,
         )
+
+    def _on_reset_countdown(self, item, prev_secs, cur_secs):
+        """Alert as a window nears renewal, crossing 1h/30/15/5/2 min.
+
+        Iterates nearest-first so a big gap between polls (e.g. after the Mac
+        wakes from sleep) fires only the most urgent mark, mirroring how the
+        highest usage threshold wins.
+        """
+        if not self._settings["notifications_enabled"]:
+            return
+        name = limit_name(item)
+        pct = item.get("percent", 0) or 0
+        reset = format_reset(item.get("resets_at"))
+        for minutes, key, label, accent, sound in reversed(reset_countdown_levels()):
+            threshold = minutes * 60
+            if cur_secs < threshold <= prev_secs:
+                if self._settings["levels"][key]["enabled"]:
+                    message = render_message(level_message(self._settings, key), name, pct, reset)
+                    self._show_toast(f"⏰ {name} renova em {label}", message, accent, sound=sound)
+                return
 
     # --- toast presentation ---
     def _show_toast(self, title, message, accent, sound=None, confetti=False, push=True):
@@ -952,8 +1047,18 @@ class UsageMonitor(rumps.App):
             )
         )
 
-        self._settings_window.setContentSize_((SETTINGS_W, content_h))
-        self._settings_window.setContentView_(root)
+        # With 11 alert rows the content is taller than most screens, so host
+        # it in a scroll view capped to the visible screen height.
+        screen = NSScreen.mainScreen()
+        max_h = int(screen.visibleFrame().size.height - 80) if screen else 800
+        win_h = min(content_h, max_h)
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, SETTINGS_W, win_h))
+        scroll.setHasVerticalScroller_(True)
+        scroll.setDrawsBackground_(False)
+        scroll.setDocumentView_(root)
+        self._settings_window.setContentSize_((SETTINGS_W, win_h))
+        self._settings_window.setContentView_(scroll)
+        root.scrollPoint_((0, 0))  # flipped doc view: top is y=0
         self._sync_settings_controls()
 
     def _sync_settings_controls(self):
