@@ -103,6 +103,10 @@ LIMIT_THRESHOLD = 100   # limit reached
 # A drop of at least this many points between refreshes means the window
 # renewed (quota is back) — worth celebrating with confetti.
 RESET_DROP = 20
+# The usage endpoint recomputes resets_at on every request, so the same
+# window drifts by ~1s between polls; a real renewal jumps hours ahead.
+# Stamps closer than this are treated as the same window.
+RESET_JITTER_TOLERANCE = 120  # seconds
 
 # System sounds played alongside each alert (paths always present on macOS).
 EARLY_SOUND = "/System/Library/Sounds/Pop.aiff"
@@ -218,6 +222,20 @@ def reset_local(resets_at):
         return datetime.fromisoformat(resets_at).astimezone()
     except ValueError:
         return None
+
+
+def same_reset_window(a, b):
+    """True when two resets_at stamps refer to the same renewal window.
+
+    Compares parsed instants with tolerance instead of string equality,
+    absorbing the per-request jitter the endpoint puts in the stamp.
+    Unparseable or missing stamps never match.
+    """
+    da = reset_local(a)
+    db = reset_local(b)
+    if da is None or db is None:
+        return False
+    return abs((da - db).total_seconds()) <= RESET_JITTER_TOLERANCE
 
 
 def clock_suffix(resets_at):
@@ -752,9 +770,10 @@ class UsageMonitor(rumps.App):
         """Fire a countdown alert as a window's time-left crosses a mark.
 
         Compares the seconds-until-reset against the value seen last poll and
-        fires once per crossing. A changed `resets_at` (first sight or a
-        freshly renewed window) only re-baselines, so renewal never triggers a
-        false countdown.
+        fires once per crossing. A changed window (first sight or a freshly
+        renewed one) only re-baselines, so renewal never triggers a false
+        countdown. Window identity uses same_reset_window, not string
+        equality — the endpoint recomputes the stamp on every request.
         """
         resets_at = item.get("resets_at")
         cur_secs = reset_seconds(resets_at)
@@ -763,7 +782,7 @@ class UsageMonitor(rumps.App):
         if cur_secs is None or prev is None:
             return
         prev_at, prev_secs = prev
-        if prev_at != resets_at or prev_secs is None:
+        if prev_secs is None or not same_reset_window(prev_at, resets_at):
             return
         self._on_reset_countdown(item, prev_secs, cur_secs)
 
