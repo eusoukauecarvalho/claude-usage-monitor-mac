@@ -10,7 +10,7 @@ comparison that fixes it.
 
 import unittest
 
-from monitor import same_reset_window
+from monitor import format_backoff, same_reset_window
 
 
 class TestSameResetWindow(unittest.TestCase):
@@ -58,6 +58,28 @@ class TestSameResetWindow(unittest.TestCase):
         a = "2026-07-30T01:00:00+00:00"
         b = "2026-07-29T22:00:00-03:00"
         self.assertTrue(same_reset_window(a, b))
+
+
+class TestFormatBackoff(unittest.TestCase):
+    """The footer text that tells a waiting monitor apart from a frozen one."""
+
+    def test_sub_minute_wait_is_not_rounded_to_zero(self):
+        self.assertEqual(format_backoff(0), "menos de 1min")
+        self.assertEqual(format_backoff(59), "menos de 1min")
+
+    def test_minutes_only_under_an_hour(self):
+        self.assertEqual(format_backoff(60), "1min")
+        self.assertEqual(format_backoff(3599), "59min")
+
+    def test_real_observed_backoff(self):
+        # Retry-After: 1610 — the value the endpoint returned while the
+        # account was suspended, which parked the monitor for ~27 minutes.
+        self.assertEqual(format_backoff(1610), "26min")
+
+    def test_hours_are_split_out(self):
+        self.assertEqual(format_backoff(3600), "1h 00min")
+        self.assertEqual(format_backoff(3900), "1h 05min")
+        self.assertEqual(format_backoff(7800), "2h 10min")
 
 
 if __name__ == "__main__":

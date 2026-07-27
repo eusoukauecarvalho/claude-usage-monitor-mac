@@ -32,6 +32,7 @@ from AppKit import (
     NSApplication,
     NSApplicationActivationPolicyAccessory,
     NSBackingStoreBuffered,
+    NSBezelStyleRounded,
     NSBezierPath,
     NSButton,
     NSColor,
@@ -68,6 +69,7 @@ from claude_config import (
     read_claude_settings,
     set_claude_option,
 )
+from snapshot import load_snapshot, save_snapshot
 from settings import (
     level_message,
     load_settings,
@@ -137,6 +139,88 @@ PAD = 20
 HEADER_H = 34
 ROW_H = 44
 FOOTER_H = 30
+RECONNECT_BTN_W = 96   # footer "Reconectar" button
+RECONNECT_BTN_H = 22
+
+# Instructions window layout (points).
+HELP_W = 470
+HELP_MAX_H = 560          # taller than this and the content scrolls instead
+HELP_HEADING_H = 24
+HELP_ITEM_NAME_H = 16
+HELP_ITEM_GAP = 8
+HELP_SECTION_GAP = 14
+HELP_BODY_SIZE = 11
+
+# Every control the app exposes, in the order the user meets it. Kept as data
+# so the window is pure layout and the wording lives in one obvious place.
+HELP_SECTIONS = [
+    ("Barra de menu", [
+        ("Ícone com %",
+         "Mostra a maior porcentagem entre as janelas de uso ativas. "
+         "⚠️ significa que ainda não há dado — sem token, sem rede, ou limite "
+         "de requisições da API."),
+        ("Abrir monitor",
+         "Abre a janela com uma barra para cada janela de uso."),
+        ("Atualizar agora",
+         "Força uma consulta imediata, ignorando a espera do limite de requisições."),
+        ("Instruções",
+         "Abre esta janela."),
+        ("Reiniciar",
+         "Reinicia o app no mesmo processo, recarregando código e configurações. "
+         "Os números salvos são restaurados, então a barra não fica vazia."),
+        ("Sair",
+         "Encerra o monitor. Se ele foi instalado como serviço, o sistema pode reabri-lo."),
+    ]),
+    ("Janela do monitor", [
+        ("Barras coloridas",
+         "Verde até 69%, laranja de 70 a 89%, vermelho de 90% em diante. "
+         "À direita de cada barra: porcentagem · quanto falta para renovar · "
+         "horário da renovação."),
+        ("📌 Fixar",
+         "Mantém a janela sempre por cima de todos os apps e áreas de trabalho. "
+         "Clique de novo para desafixar. O ícone fica opaco quando fixado."),
+        ("Reconectar",
+         "Zera a espera do limite de requisições, relê o token do Keychain e busca "
+         "os dados na hora. Use quando os números pararem de mudar."),
+        ("Rodapé",
+         "Em dia, mostra o horário da última atualização. Com erro, mostra o motivo "
+         "e quanto falta para a próxima tentativa automática."),
+    ]),
+    ("Configurações · Notificações", [
+        ("Todas as notificações",
+         "Chave mestra: desligue para silenciar todos os alertas de uma vez."),
+        ("Alertas de uso (70/80/90/95/100%)",
+         "Disparam uma única vez, no momento em que o uso cruza aquela marca."),
+        ("Janela renovada",
+         "Comemora com confete quando a quota volta ao zero."),
+        ("Contagem regressiva (1h/30/15/5/2 min)",
+         "Avisam quando falta esse tempo para a janela renovar, independente do uso."),
+        ("Mensagens personalizadas",
+         "O campo abaixo de cada alerta troca o texto dele. Você pode usar {nome}, "
+         "{pct} e {reset}. Apague tudo para voltar à mensagem padrão."),
+    ]),
+    ("Configurações · Som", [
+        ("Som de notificação",
+         "Desligue para alertas silenciosos — o card na tela e a notificação do "
+         "sistema continuam aparecendo."),
+    ]),
+    ("Configurações · Claude Code", [
+        ("Modelo padrão / Effort padrão",
+         "Gravam direto no seu ~/.claude/settings.json, valendo para as próximas "
+         "sessões do Claude Code."),
+        ("Ultracode",
+         "Liga effort xhigh com orquestração multiagente. Gasta bem mais tokens."),
+    ]),
+    ("Quando parecer travado", [
+        ("Números parados",
+         "Quase sempre é limite de requisições da API, não erro do app. A resposta "
+         "traz um tempo de espera que pode passar de 25 minutos, e o monitor "
+         "respeita essa espera. O rodapé mostra quanto falta."),
+        ("O que fazer",
+         "Clique em Reconectar. Se continuar, o rodapé dirá o tempo restante — é "
+         "só aguardar. Relogar não resolve limite de requisições."),
+    ]),
+]
 
 # Settings window layout (points).
 SETTINGS_W = 400
@@ -314,6 +398,21 @@ def retry_after_seconds(http_error):
         return DEFAULT_RETRY_AFTER
 
 
+def format_backoff(seconds):
+    """Compact '26min' / '1h 05min' text for how long a backoff still lasts.
+
+    The endpoint can ask for a wait of half an hour or more. Saying so in the
+    footer is what separates "esperando" from "travado" for whoever is
+    looking at the window.
+    """
+    minutes = int(seconds) // 60
+    if minutes < 1:
+        return "menos de 1min"
+    if minutes < 60:
+        return f"{minutes}min"
+    return f"{minutes // 60}h {minutes % 60:02d}min"
+
+
 def severity_color(percent):
     """NSColor for a bar based on its percentage."""
     if percent >= CRIT_THRESHOLD:
@@ -371,6 +470,70 @@ def make_pin_button(frame, pinned, target):
     btn.setTarget_(target)
     btn.setAction_("controlChanged:")
     return btn
+
+
+def make_reconnect_button(frame, target):
+    """The 'Reconectar' button in the window footer.
+
+    Always present, not only while stale: it is the one control that clears a
+    long rate-limit backoff on demand, and hunting for it exactly when the
+    numbers look stuck is the worst possible time to discover it is hidden.
+    """
+    btn = NSButton.alloc().initWithFrame_(frame)
+    btn.setTitle_("Reconectar")
+    btn.setBezelStyle_(NSBezelStyleRounded)
+    btn.setFont_(NSFont.systemFontOfSize_(11))
+    btn.setToolTip_("Ignorar a espera do limite de requisições e buscar os dados agora")
+    btn.setTarget_(target)
+    btn.setAction_("controlChanged:")
+    return btn
+
+
+def wrapped_height(text, width, size):
+    """Rough height a wrapped string needs — enough to lay the help window out.
+
+    An estimate, not a measurement: it only has to be generous enough that
+    nothing clips, and the scroll view absorbs any slack.
+    """
+    chars_per_line = max(int(width / (size * 0.52)), 1)
+    lines = sum(max(1, math.ceil(len(para) / chars_per_line)) for para in text.split("\n"))
+    return lines * (size + 5)
+
+
+def build_help_document(width):
+    """The scrollable content of the instructions window: (view, height)."""
+    body_w = width - 2 * PAD
+
+    y = PAD
+    placed = []  # (kind, payload, y) laid out top-down before the view exists
+    for heading, items in HELP_SECTIONS:
+        placed.append(("heading", heading, y))
+        y += HELP_HEADING_H
+        for name, desc in items:
+            desc_h = wrapped_height(desc, body_w, HELP_BODY_SIZE)
+            placed.append(("item", (name, desc, desc_h), y))
+            y += HELP_ITEM_NAME_H + desc_h + HELP_ITEM_GAP
+        y += HELP_SECTION_GAP
+    doc_h = y - HELP_SECTION_GAP + PAD
+
+    doc = FlippedView.alloc().initWithFrame_(NSMakeRect(0, 0, width, doc_h))
+    for kind, payload, top in placed:
+        if kind == "heading":
+            doc.addSubview_(
+                make_label(NSMakeRect(PAD, top, body_w, 18), payload, size=13, bold=True)
+            )
+            continue
+        name, desc, desc_h = payload
+        doc.addSubview_(
+            make_label(NSMakeRect(PAD, top, body_w, HELP_ITEM_NAME_H), name, size=12, bold=True)
+        )
+        doc.addSubview_(
+            make_wrapping_label(
+                NSMakeRect(PAD, top + HELP_ITEM_NAME_H, body_w, desc_h),
+                desc, HELP_BODY_SIZE, NSColor.secondaryLabelColor(),
+            )
+        )
+    return doc, doc_h
 
 
 def make_bar(frame, percent, color):
@@ -631,16 +794,21 @@ class UsageMonitor(rumps.App):
         super().__init__("", icon=LOGO_PATH, template=False, quit_button=None)
         self.title = "…"
         self._window = None
-        self._limits = []
-        self._stamp = "—"
-        self._extra_line = None
-        self._stale = None
+        # Start from the last good fetch on disk. A 429 backoff can last half
+        # an hour, so a process that starts inside one has no way to fill the
+        # display — without this the menu bar sits empty until the limit lifts.
+        cached = load_snapshot()
+        self._limits = cached["limits"]
+        self._stamp = cached["stamp"] or "—"
+        self._extra_line = cached["extra_line"]
+        self._stale = "Dados salvos — buscando atualização" if cached["limits"] else None
         self._retry_after_ts = 0.0
         self._prev_percents = {}  # kind -> last seen percent, for edge alerts
         self._prev_reset = {}  # kind -> (resets_at, seconds_left), for countdown alerts
         self._toasts = []  # live toast panels (kept referenced so ARC won't drop them)
         self._settings = load_settings()
         self._settings_window = None
+        self._help_window = None
         self._controls = {}  # identifier -> NSSwitch/NSTextField in the settings window
         self._popup_values = {}  # popup identifier -> ordered list of choice values
         self._control_target = None  # created lazily with the settings window
@@ -649,7 +817,11 @@ class UsageMonitor(rumps.App):
         NSApplication.sharedApplication().setActivationPolicy_(
             NSApplicationActivationPolicyAccessory
         )
-        self.menu = ["Abrir monitor", "Atualizar agora", None, "Configurações", None, "Reiniciar", "Sair"]
+        self.menu = [
+            "Abrir monitor", "Atualizar agora", None,
+            "Configurações", "Instruções", None,
+            "Reiniciar", "Sair",
+        ]
         self.timer = rumps.Timer(self.refresh, REFRESH_SECONDS)
         self.timer.start()
         self.refresh(None)
@@ -670,9 +842,61 @@ class UsageMonitor(rumps.App):
     def open_settings(self, _):
         self._present_settings_window()
 
+    @rumps.clicked("Instruções")
+    def open_help(self, _):
+        self._present_help_window()
+
+    def _present_help_window(self):
+        """Show the instructions window, building it once and reusing it after."""
+        if self._help_window is None:
+            self._build_help_window()
+        NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
+        self._help_window.makeKeyAndOrderFront_(None)
+
+    def _build_help_window(self):
+        doc, doc_h = build_help_document(HELP_W)
+        visible_h = min(doc_h, HELP_MAX_H)
+
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 0, HELP_W, visible_h))
+        scroll.setHasVerticalScroller_(True)
+        scroll.setDrawsBackground_(False)
+        scroll.setDocumentView_(doc)
+        # Flipped document view: scroll to the top, not the bottom.
+        doc.scrollPoint_((0, 0))
+
+        win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(0, 0, HELP_W, visible_h),
+            NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable,
+            NSBackingStoreBuffered,
+            False,
+        )
+        win.setTitle_("Instruções")
+        win.setReleasedWhenClosed_(False)
+        win.setContentView_(scroll)
+        win.center()
+        self._help_window = win
+
     @rumps.clicked("Atualizar agora")
     def manual_refresh(self, _):
         self._retry_after_ts = 0.0  # user asked explicitly: bypass any backoff
+        self.refresh(None)
+
+    def _on_reconnect(self, _sender):
+        """Force a fresh attempt from the window, ignoring any active backoff.
+
+        A 429 parks the monitor in a backoff window the endpoint chooses (it
+        has asked for ~27 min), and every scheduled refresh is skipped until
+        it expires — so the numbers sit still and the app looks frozen even
+        though it is healthy. This drops that window and fetches immediately.
+
+        The alert baselines go too: after a long gap the cached percentages
+        are stale, and comparing fresh data against them would fire bogus
+        threshold crossings. Clearing them makes the next refresh re-baseline
+        silently, exactly like the first one after launch.
+        """
+        self._retry_after_ts = 0.0
+        self._prev_percents = {}
+        self._prev_reset = {}
         self.refresh(None)
 
     @rumps.clicked("Reiniciar")
@@ -709,10 +933,11 @@ class UsageMonitor(rumps.App):
             data = fetch_usage(token)
         except HTTPError as exc:
             if exc.code == 429:
-                self._retry_after_ts = time.monotonic() + retry_after_seconds(exc)
-                self._stale = "Limite de requisições atingido — mostrando último dado"
-            elif exc.code == 401:
-                self._stale = "Token expirado — rode /usage no Claude Code"
+                wait = retry_after_seconds(exc)
+                self._retry_after_ts = time.monotonic() + wait
+                self._stale = f"Limite de requisições — nova tentativa em {format_backoff(wait)}"
+            elif exc.code in (401, 403):
+                self._stale = "Sessão recusada — clique em Reconectar ou rode /usage no Claude Code"
             else:
                 self._stale = f"Erro HTTP {exc.code} — mostrando último dado"
             self._render()
@@ -735,6 +960,9 @@ class UsageMonitor(rumps.App):
         else:
             self._extra_line = None
         self._stale = None
+        # Persist before rendering: whatever is on screen should survive a
+        # restart, including one triggered right after this fetch.
+        save_snapshot(self._limits, self._stamp, self._extra_line)
         self._check_alerts()
         self._render()
 
@@ -920,7 +1148,11 @@ class UsageMonitor(rumps.App):
         self.menu.add(rumps.MenuItem("Atualizar agora", callback=self.manual_refresh))
         self.menu.add(rumps.separator)
         self.menu.add(rumps.MenuItem("Configurações", callback=self.open_settings))
+        self.menu.add(rumps.MenuItem("Instruções", callback=self.open_help))
         self.menu.add(rumps.separator)
+        # Rebuilt on every render, so anything omitted here disappears from the
+        # menu after the first refresh — "Reiniciar" silently did exactly that.
+        self.menu.add(rumps.MenuItem("Reiniciar", callback=self.restart_app))
         self.menu.add(rumps.MenuItem("Sair", callback=self.quit_app))
 
         if self._window is not None and self._window.isVisible():
@@ -1137,6 +1369,7 @@ class UsageMonitor(rumps.App):
         win.center()
         self._window = win
         self._pin_target = ControlTarget.alloc().initWithHandler_(self._on_pin_toggled)
+        self._reconnect_target = ControlTarget.alloc().initWithHandler_(self._on_reconnect)
         self._apply_pin_state()
 
     def _apply_pin_state(self):
@@ -1224,7 +1457,16 @@ class UsageMonitor(rumps.App):
             footer_text = f"Atualizado {self._stamp} · atualiza a cada {REFRESH_SECONDS}s"
             footer_color = NSColor.tertiaryLabelColor()
         root.addSubview_(
-            make_label(NSMakeRect(PAD, y + 4, cw, 16), footer_text, size=11, color=footer_color)
+            make_label(
+                NSMakeRect(PAD, y + 5, cw - RECONNECT_BTN_W - 8, 16),
+                footer_text, size=11, color=footer_color,
+            )
+        )
+        root.addSubview_(
+            make_reconnect_button(
+                NSMakeRect(PAD + cw - RECONNECT_BTN_W, y + 2, RECONNECT_BTN_W, RECONNECT_BTN_H),
+                self._reconnect_target,
+            )
         )
         self._window.setContentView_(root)
 
